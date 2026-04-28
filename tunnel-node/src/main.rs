@@ -22,11 +22,13 @@ use axum::{routing::post, Json, Router};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::{lookup_host, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::task::JoinSet;
+
+mod udpgw;
 
 /// Structured error code returned when the tunnel-node receives an op it
 /// doesn't recognize. Clients use this (rather than string-matching `e`) to
@@ -95,8 +97,30 @@ const UDP_QUEUE_DROP_LOG_STRIDE: u64 = 100;
 // Session
 // ---------------------------------------------------------------------------
 
+/// Writer half — either a real TCP socket or an in-process duplex channel
+/// (used for virtual sessions like udpgw).
+enum SessionWriter {
+    Tcp(OwnedWriteHalf),
+    Duplex(tokio::io::WriteHalf<tokio::io::DuplexStream>),
+}
+
+impl SessionWriter {
+    async fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        match self {
+            SessionWriter::Tcp(w) => w.write_all(buf).await,
+            SessionWriter::Duplex(w) => w.write_all(buf).await,
+        }
+    }
+    async fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            SessionWriter::Tcp(w) => w.flush().await,
+            SessionWriter::Duplex(w) => w.flush().await,
+        }
+    }
+}
+
 struct SessionInner {
-    writer: Mutex<OwnedWriteHalf>,
+    writer: Mutex<SessionWriter>,
     read_buf: Mutex<Vec<u8>>,
     eof: AtomicBool,
     last_active: Mutex<Instant>,
@@ -110,6 +134,17 @@ struct SessionInner {
 struct ManagedSession {
     inner: Arc<SessionInner>,
     reader_handle: tokio::task::JoinHandle<()>,
+    /// For udpgw sessions, the server task handle (so we can abort on close).
+    udpgw_handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl ManagedSession {
+    fn abort_all(&self) {
+        self.reader_handle.abort();
+        if let Some(ref h) = self.udpgw_handle {
+            h.abort();
+        }
+    }
 }
 
 /// UDP equivalent of `SessionInner`. Holds a *connected* `UdpSocket`
@@ -148,7 +183,7 @@ async fn create_session(host: &str, port: u16) -> std::io::Result<ManagedSession
     let (reader, writer) = stream.into_split();
 
     let inner = Arc::new(SessionInner {
-        writer: Mutex::new(writer),
+        writer: Mutex::new(SessionWriter::Tcp(writer)),
         read_buf: Mutex::new(Vec::with_capacity(32768)),
         eof: AtomicBool::new(false),
         last_active: Mutex::new(Instant::now()),
@@ -158,10 +193,30 @@ async fn create_session(host: &str, port: u16) -> std::io::Result<ManagedSession
     let inner_ref = inner.clone();
     let reader_handle = tokio::spawn(reader_task(reader, inner_ref));
 
-    Ok(ManagedSession { inner, reader_handle })
+    Ok(ManagedSession { inner, reader_handle, udpgw_handle: None })
 }
 
-async fn reader_task(mut reader: OwnedReadHalf, session: Arc<SessionInner>) {
+/// Create a virtual udpgw session backed by an in-process duplex channel.
+fn create_udpgw_session() -> ManagedSession {
+    let (client_half, server_half) = tokio::io::duplex(65536);
+    let (read_half, write_half) = tokio::io::split(client_half);
+
+    let inner = Arc::new(SessionInner {
+        writer: Mutex::new(SessionWriter::Duplex(write_half)),
+        read_buf: Mutex::new(Vec::with_capacity(32768)),
+        eof: AtomicBool::new(false),
+        last_active: Mutex::new(Instant::now()),
+        notify: Notify::new(),
+    });
+
+    let inner_ref = inner.clone();
+    let reader_handle = tokio::spawn(reader_task(read_half, inner_ref));
+    let udpgw_handle = Some(tokio::spawn(udpgw::udpgw_server_task(server_half)));
+
+    ManagedSession { inner, reader_handle, udpgw_handle }
+}
+
+async fn reader_task(mut reader: impl AsyncRead + Unpin, session: Arc<SessionInner>) {
     let mut buf = vec![0u8; 65536];
     loop {
         match reader.read(&mut buf).await {
@@ -480,6 +535,16 @@ struct AppState {
     sessions: Arc<Mutex<HashMap<String, ManagedSession>>>,
     udp_sessions: Arc<Mutex<HashMap<String, ManagedUdpSession>>>,
     auth_key: String,
+    /// Active probing defense: when false (default, production), bad
+    /// AUTH_KEY responses are a generic-looking 404 with no JSON-shaped
+    /// "unauthorized" body — same as a static nginx 404. Active scanners
+    /// that POST malformed payloads to `/tunnel` to discover proxy
+    /// endpoints categorize this as a non-tunnel host and move on.
+    /// Enable via `MHRV_DIAGNOSTIC=1` for setup/debugging — restores the
+    /// previous JSON `{"e":"unauthorized"}` body so it's clear *which*
+    /// of "wrong key", "wrong URL path", or "wrong tunnel-node" you've
+    /// hit. (Inspired by #365 Section 3.)
+    diagnostic_mode: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -553,19 +618,41 @@ struct BatchResponse {
 async fn handle_tunnel(
     State(state): State<AppState>,
     Json(req): Json<TunnelRequest>,
-) -> Json<TunnelResponse> {
+) -> axum::response::Response {
     if req.k != state.auth_key {
-        return Json(TunnelResponse::error("unauthorized"));
+        return decoy_or_unauthorized(state.diagnostic_mode);
     }
-    match req.op.as_str() {
-        "connect" => Json(handle_connect(&state, req.host, req.port).await),
+    let resp: TunnelResponse = match req.op.as_str() {
+        "connect" => handle_connect(&state, req.host, req.port).await,
         "connect_data" => {
-            Json(handle_connect_data_single(&state, req.host, req.port, req.data).await)
+            handle_connect_data_single(&state, req.host, req.port, req.data).await
         }
-        "data" => Json(handle_data_single(&state, req.sid, req.data).await),
-        "close" => Json(handle_close(&state, req.sid).await),
-        other => Json(TunnelResponse::unsupported_op(other)),
+        "data" => handle_data_single(&state, req.sid, req.data).await,
+        "close" => handle_close(&state, req.sid).await,
+        other => TunnelResponse::unsupported_op(other),
+    };
+    Json(resp).into_response()
+}
+
+/// Active-probing defense for the bad-auth path. Production default is
+/// a 404 with a generic "Not Found" HTML body that mimics a vanilla
+/// nginx/apache static error page — active scanners categorize this
+/// as a regular web server with nothing interesting and move on.
+/// `MHRV_DIAGNOSTIC=1` restores the previous JSON `{"e":"unauthorized"}`
+/// body so misconfigured clients get a clear error during setup.
+fn decoy_or_unauthorized(diagnostic_mode: bool) -> axum::response::Response {
+    if diagnostic_mode {
+        return Json(TunnelResponse::error("unauthorized")).into_response();
     }
+    let body = "<html>\r\n<head><title>404 Not Found</title></head>\r\n\
+                <body>\r\n<center><h1>404 Not Found</h1></center>\r\n\
+                <hr><center>nginx</center>\r\n</body>\r\n</html>\r\n";
+    (
+        StatusCode::NOT_FOUND,
+        [(header::CONTENT_TYPE, "text/html")],
+        body,
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -602,10 +689,20 @@ async fn handle_batch(
     };
 
     if req.k != state.auth_key {
-        let resp = serde_json::to_vec(&BatchResponse {
-            r: vec![TunnelResponse::error("unauthorized")],
-        }).unwrap_or_default();
-        return (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], resp);
+        if state.diagnostic_mode {
+            let resp = serde_json::to_vec(&BatchResponse {
+                r: vec![TunnelResponse::error("unauthorized")],
+            }).unwrap_or_default();
+            return (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], resp);
+        }
+        // Production: same nginx-404 decoy as the single-op path. See
+        // `decoy_or_unauthorized` for rationale.
+        let body = "<html>\r\n<head><title>404 Not Found</title></head>\r\n\
+                    <body>\r\n<center><h1>404 Not Found</h1></center>\r\n\
+                    <hr><center>nginx</center>\r\n</body>\r\n</html>\r\n"
+            .as_bytes()
+            .to_vec();
+        return (StatusCode::NOT_FOUND, [(header::CONTENT_TYPE, "text/html")], body);
     }
 
     // Process all ops in two phases.
@@ -971,9 +1068,13 @@ async fn handle_connect(state: &AppState, host: Option<String>, port: Option<u16
         Ok(v) => v,
         Err(r) => return r,
     };
-    let session = match create_session(&host, port).await {
-        Ok(s) => s,
-        Err(e) => return TunnelResponse::error(format!("connect failed: {}", e)),
+    let session = if udpgw::is_udpgw_dest(&host, port) {
+        create_udpgw_session()
+    } else {
+        match create_session(&host, port).await {
+            Ok(s) => s,
+            Err(e) => return TunnelResponse::error(format!("connect failed: {}", e)),
+        }
     };
     let sid = uuid::Uuid::new_v4().to_string();
     tracing::info!("session {} -> {}:{}", sid, host, port);
@@ -995,9 +1096,13 @@ async fn handle_connect_data_phase1(
 ) -> Result<(String, Arc<SessionInner>), TunnelResponse> {
     let (host, port) = validate_host_port(host, port)?;
 
-    let session = create_session(&host, port)
-        .await
-        .map_err(|e| TunnelResponse::error(format!("connect failed: {}", e)))?;
+    let session = if udpgw::is_udpgw_dest(&host, port) {
+        create_udpgw_session()
+    } else {
+        create_session(&host, port)
+            .await
+            .map_err(|e| TunnelResponse::error(format!("connect failed: {}", e)))?
+    };
 
     // Any failure below this point must abort the reader task, otherwise
     // the newly-opened upstream TCP connection would leak. Keep the
@@ -1146,7 +1251,7 @@ async fn handle_close(state: &AppState, sid: Option<String>) -> TunnelResponse {
         _ => return TunnelResponse::error("missing sid"),
     };
     if let Some(s) = state.sessions.lock().await.remove(&sid) {
-        s.reader_handle.abort();
+        s.abort_all();
         tracing::info!("session {} closed by client", sid);
     }
     if let Some(s) = state.udp_sessions.lock().await.remove(&sid) {
@@ -1248,7 +1353,20 @@ async fn main() {
         Arc::new(Mutex::new(HashMap::new()));
     tokio::spawn(cleanup_task(sessions.clone(), udp_sessions.clone()));
 
-    let state = AppState { sessions, udp_sessions, auth_key };
+    // MHRV_DIAGNOSTIC=1 in env restores verbose JSON error responses on
+    // bad auth (instead of the nginx-404 decoy). Use during setup so
+    // misconfigured clients see "unauthorized"; flip back off in prod.
+    let diagnostic_mode = std::env::var("MHRV_DIAGNOSTIC")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if diagnostic_mode {
+        tracing::warn!(
+            "MHRV_DIAGNOSTIC=1 — bad-auth responses are verbose JSON \
+             errors instead of the production nginx-404 decoy. Disable \
+             before exposing this tunnel-node to the public internet."
+        );
+    }
+    let state = AppState { sessions, udp_sessions, auth_key, diagnostic_mode };
 
     let app = Router::new()
         .route("/tunnel", post(handle_tunnel))
@@ -1283,6 +1401,10 @@ mod tests {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             udp_sessions: Arc::new(Mutex::new(HashMap::new())),
             auth_key: "test-key".into(),
+            // Tests assert against the JSON `unauthorized` body shape
+            // (see e.g. `bad_auth_returns_unauthorized`), so they need
+            // diagnostic_mode enabled. Production default is false.
+            diagnostic_mode: true,
         }
     }
 
@@ -1430,7 +1552,7 @@ mod tests {
         let (_reader, writer) = client.into_split();
 
         Arc::new(SessionInner {
-            writer: Mutex::new(writer),
+            writer: Mutex::new(SessionWriter::Tcp(writer)),
             read_buf: Mutex::new(Vec::new()),
             eof: AtomicBool::new(false),
             last_active: Mutex::new(Instant::now()),
@@ -1597,7 +1719,7 @@ mod tests {
         let stream = TcpStream::connect(addr).await.unwrap();
         let (reader, writer) = stream.into_split();
         let inner = Arc::new(SessionInner {
-            writer: Mutex::new(writer),
+            writer: Mutex::new(SessionWriter::Tcp(writer)),
             read_buf: Mutex::new(Vec::new()),
             eof: AtomicBool::new(false),
             last_active: Mutex::new(Instant::now()),

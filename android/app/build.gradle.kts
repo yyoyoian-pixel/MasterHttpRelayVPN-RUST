@@ -14,8 +14,8 @@ android {
         applicationId = "com.therealaleph.mhrv"
         minSdk = 24 // Android 7.0 — covers 99%+ of live devices.
         targetSdk = 34
-        versionCode = 139
-        versionName = "1.6.0"
+        versionCode = 158
+        versionName = "1.8.1"
 
         // Ship all four mainstream Android ABIs:
         //   - arm64-v8a      — 95%+ of real-world Android phones since 2019
@@ -135,6 +135,10 @@ dependencies {
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
+
+    // QR code generation + scanning (self-contained, no ML Kit needed).
+    implementation("com.google.zxing:core:3.5.3")
+    implementation("com.journeyapps:zxing-android-embedded:4.3.0")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
     debugImplementation("androidx.compose.ui:ui-test-manifest")
