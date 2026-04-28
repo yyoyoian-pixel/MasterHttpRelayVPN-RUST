@@ -35,9 +35,21 @@ COPY src/ ./src/
 # BuildKit cache mounts: cargo's registry/git caches and the target/
 # directory persist across builds, dramatically speeding up rebuilds when
 # only application code changes.
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/usr/local/cargo/git \
-    --mount=type=cache,target=/app/target \
+#
+# `id=...-$TARGETPLATFORM` is load-bearing on multi-arch builds. Without
+# it, BuildKit defaults to a single shared cache across architectures
+# and the `linux/amd64` + `linux/arm64` jobs race on the same on-disk
+# `/usr/local/cargo/registry/src/.../<crate>/.cargo-ok` extraction. The
+# second-arriving arch hits `File exists (os error 17)` mid-unpack and
+# the whole multi-arch build fails. Per-platform cache id keeps each
+# arch's cache isolated; warm-build speedup is preserved per-arch.
+# `target` cache is also platform-scoped because target/ holds object
+# files for one ABI and sharing them across arches would just produce
+# misses or, worse, invalid linking.
+ARG TARGETPLATFORM
+RUN --mount=type=cache,target=/usr/local/cargo/registry,id=cargo-registry-${TARGETPLATFORM} \
+    --mount=type=cache,target=/usr/local/cargo/git,id=cargo-git-${TARGETPLATFORM} \
+    --mount=type=cache,target=/app/target,id=app-target-${TARGETPLATFORM} \
     cargo build --release --bin tunnel-node && \
     cp /app/target/release/tunnel-node /usr/local/bin/tunnel-node
 

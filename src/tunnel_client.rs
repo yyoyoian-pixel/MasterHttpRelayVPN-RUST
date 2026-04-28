@@ -14,7 +14,7 @@ use std::collections::HashMap;
 // reason; reuse it here. `AtomicBool` works fine in std on every target.
 use portable_atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD as B64;
@@ -23,7 +23,7 @@ use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, Semaphore};
 
-use crate::domain_fronter::{BatchOp, DomainFronter, TunnelResponse};
+use crate::domain_fronter::{BatchOp, DomainFronter, FronterError, TunnelResponse};
 
 /// Apps Script allows 30 concurrent executions per account / deployment.
 const CONCURRENCY_PER_DEPLOYMENT: usize = 30;
@@ -55,6 +55,16 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(35);
 /// connect saves one Apps Script round-trip per new flow.
 const CLIENT_FIRST_DATA_WAIT: Duration = Duration::from_millis(50);
 
+/// How long the muxer holds open the batch buffer after the first op
+/// arrives, waiting for more ops to coalesce. Issue #231 — the previous
+/// implementation drained `try_recv()` *immediately* after the first
+/// message landed, so under any non-bursty workload every batch held
+/// exactly one op (defeating the entire batching premise). 8 ms is small
+/// vs the ~2-7 s Apps Script round-trip the batch is amortizing, but
+/// long enough that concurrent HTTP/2 stream openings, parallel fetches,
+/// or any other burst lands in the same batch.
+const BATCH_COALESCE_WINDOW: Duration = Duration::from_millis(8);
+
 /// Structured error code the tunnel-node returns when it doesn't know the
 /// op (version mismatch). Must match `tunnel-node/src/main.rs`.
 const CODE_UNSUPPORTED_OP: &str = "UNSUPPORTED_OP";
@@ -68,6 +78,28 @@ const CODE_UNSUPPORTED_OP: &str = "UNSUPPORTED_OP";
 /// floor, so network jitter on either side won't false-trigger.
 const LEGACY_DETECT_THRESHOLD: Duration = Duration::from_millis(1500);
 
+/// How long a deployment stays in "legacy / no long-poll" mode after the
+/// last detection. Must be much longer than `LEGACY_DETECT_THRESHOLD` so a
+/// freshly-marked deployment doesn't immediately self-recover, but short
+/// enough that a redeployed / recovered tunnel-node gets re-probed without
+/// requiring a process restart. 60 s lets one stuck deployment widen its
+/// own poll cadence without poisoning the others, and self-resets so an
+/// upgraded tunnel-node returns to the long-poll fast path on its own.
+const LEGACY_RECOVER_AFTER: Duration = Duration::from_secs(60);
+
+/// How long to remember a `Network is unreachable` / `No route to host`
+/// failure for a given `(host, port)`. While cached, the proxy short-circuits
+/// repeat CONNECTs with an immediate "host unreachable" reply instead of
+/// burning a 1.5–2s tunnel batch round-trip on a target that just failed.
+/// Real motivator: IPv6-only probe hostnames (e.g. `ds6.probe.*`) on devices
+/// without IPv6 — the OS retries the probe every ~1.5s for 10s+, generating
+/// 5–10 wasted tunnel sessions per probe.
+const UNREACHABLE_CACHE_TTL: Duration = Duration::from_secs(30);
+
+/// Hard cap on negative-cache size. Browsing pulls in dozens of distinct
+/// hosts; we don't want a runaway map. Pruned opportunistically on insert.
+const UNREACHABLE_CACHE_MAX: usize = 256;
+
 /// Ports where the *server* speaks first (SMTP banner, SSH identification,
 /// POP3/IMAP greeting, FTP banner). On these, waiting for client bytes
 /// gains nothing and just adds handshake latency — skip the pre-read.
@@ -77,9 +109,43 @@ fn is_server_speaks_first(port: u16) -> bool {
     matches!(port, 21 | 22 | 25 | 80 | 110 | 143 | 587)
 }
 
+/// Recognize the tunnel-node's connect-error strings that mean
+/// "this destination is fundamentally unreachable from the tunnel-node's
+/// network right now" — distinct from refused/reset/timeout, which can be
+/// transient. These come through as the inner `e` of a `TunnelResponse`
+/// after the tunnel-node's std::io::Error is stringified, so we match on
+/// substrings rather than `ErrorKind`. Linux: errno 101 (ENETUNREACH),
+/// errno 113 (EHOSTUNREACH). Format varies a bit across libc/Tokio
+/// versions, so cover both the human text and the os-error tag.
+fn is_unreachable_error_str(s: &str) -> bool {
+    let lc = s.to_ascii_lowercase();
+    lc.contains("network is unreachable")
+        || lc.contains("no route to host")
+        || lc.contains("os error 101")
+        || lc.contains("os error 113")
+}
+
+/// Canonicalize a host string for use as a negative-cache key. DNS names
+/// are case-insensitive and may carry a trailing root-label dot, so
+/// `Example.COM:443`, `example.com:443`, and `example.com.:443` are all the
+/// same destination. IPv4 / IPv6 literals are unaffected — IPv4 has no
+/// letters, and `Ipv6Addr::to_string()` already emits lowercase.
+fn normalize_cache_host(host: &str) -> String {
+    let trimmed = host.strip_suffix('.').unwrap_or(host);
+    trimmed.to_ascii_lowercase()
+}
+
 // ---------------------------------------------------------------------------
 // Multiplexer
 // ---------------------------------------------------------------------------
+
+/// Reply payload for ops that go through `fire_batch`. The `String` is the
+/// `script_id` of the deployment that processed the batch — needed by
+/// `tunnel_loop`'s legacy-detection and per-deployment skip-when-idle
+/// decisions, which can't reach `fire_batch`'s local `script_id` any
+/// other way. Plain `Connect` doesn't go through `fire_batch` and keeps
+/// the simpler reply type.
+type BatchedReply = oneshot::Sender<Result<(TunnelResponse, String), String>>;
 
 enum MuxMsg {
     Connect {
@@ -93,23 +159,23 @@ enum MuxMsg {
         // Arc so the caller can hand the buffer to the mux AND keep a ref
         // for the fallback path without an extra 64 KB copy per session.
         data: Arc<Vec<u8>>,
-        reply: oneshot::Sender<Result<TunnelResponse, String>>,
+        reply: BatchedReply,
     },
     Data {
         sid: String,
         data: Vec<u8>,
-        reply: oneshot::Sender<Result<TunnelResponse, String>>,
+        reply: BatchedReply,
     },
     UdpOpen {
         host: String,
         port: u16,
         data: Vec<u8>,
-        reply: oneshot::Sender<Result<TunnelResponse, String>>,
+        reply: BatchedReply,
     },
     UdpData {
         sid: String,
         data: Vec<u8>,
-        reply: oneshot::Sender<Result<TunnelResponse, String>>,
+        reply: BatchedReply,
     },
     Close {
         sid: String,
@@ -122,16 +188,48 @@ pub struct TunnelMux {
     /// `connect_data` as unsupported. Subsequent sessions skip the
     /// optimistic path entirely and go straight to plain connect + data.
     connect_data_unsupported: Arc<AtomicBool>,
-    /// Set to `true` after we observe an empty poll round-trip that
-    /// returned in less than `LEGACY_DETECT_THRESHOLD` with no data.
-    /// On a long-poll-capable tunnel-node, an empty poll either returns
-    /// quickly *with data* (push arrived) or holds open until the
-    /// server's `LONGPOLL_DEADLINE`. A fast empty reply means the server
-    /// is doing the legacy fixed-sleep drain — in that mode, hammering
-    /// idle sessions at the new 500 ms cadence wastes Apps Script quota
-    /// for no benefit, so the loop reverts to the pre-long-poll
-    /// "skip empty polls when idle" behavior.
-    server_no_longpoll: Arc<AtomicBool>,
+    /// Per-deployment legacy state: `script_id` → time it was last
+    /// observed serving an empty poll faster than `LEGACY_DETECT_THRESHOLD`.
+    /// Absence means "long-poll capable, or untested." Entries expire after
+    /// `LEGACY_RECOVER_AFTER` so a redeployed / recovered tunnel-node
+    /// rejoins the long-poll fast path without requiring a process restart.
+    ///
+    /// Note: the per-deployment marks here do *not* drive a per-deployment
+    /// poll cadence — the `tunnel_loop` cadence (read-timeout backoff and
+    /// skip-empty-when-idle) is gated on the aggregate `all_legacy`,
+    /// because the next op's deployment is chosen later by
+    /// `next_script_id()` round-robin and the loop can't pre-select. What
+    /// the per-deployment design *does* fix vs the old single AtomicBool:
+    ///   * one slow / legacy deployment can no longer flip the aggregate
+    ///     true on its own — every deployment has to be marked first;
+    ///   * deployments recover individually on the TTL, so an upgraded
+    ///     tunnel-node lifts the aggregate without needing the others to
+    ///     also recover or the process to restart;
+    ///   * the warn log fires once per (deployment, recovery cycle), so
+    ///     re-detection after recovery is a real signal in the logs.
+    /// The cost: legacy deployments still receive fast empty polls in
+    /// mixed mode (round-robin doesn't know to avoid them). Worth it to
+    /// keep pushed bytes flowing through the long-poll-capable peers.
+    legacy_deployments: Mutex<HashMap<String, Instant>>,
+    /// Lock-free hot-path snapshot of "every known deployment is currently
+    /// in legacy mode." Recomputed under `legacy_deployments`'s mutex on
+    /// every mark/expire and read with a relaxed load from `tunnel_loop`.
+    /// True only when this process has fast-empty observations for *all*
+    /// `num_scripts` deployments simultaneously — that's when the per-
+    /// session 30 s read-timeout backoff (the only setting where there is
+    /// no per-deployment alternative) is still appropriate. Invariant: the
+    /// atomic is always written *after* the map insert, under the same
+    /// lock, so any reader that sees `true` was preceded by a complete
+    /// map update.
+    all_legacy: Arc<AtomicBool>,
+    /// Count of *unique* configured deployment IDs at start time.
+    /// Snapshotted from `fronter.script_id_list()` deduped, since the
+    /// aggregate gate compares this against `legacy_deployments.len()`
+    /// (a HashMap, so unique-keyed) — using the raw configured count
+    /// would make the gate unreachable whenever a user lists the same
+    /// script_id twice. Blacklisted-but-configured deployments still
+    /// count here; see `all_servers_legacy` for why.
+    num_scripts: usize,
     /// Pre-read observability. Lets an operator see whether the 50 ms
     /// wait-for-first-bytes is pulling its weight:
     ///   * `preread_win` — client sent bytes in time, bundled with connect
@@ -149,14 +247,37 @@ pub struct TunnelMux {
     /// Separate monotonic counter used only to trigger the summary log
     /// (avoids a race where two threads both see `total % 100 == 0`).
     preread_total_events: AtomicU64,
+    /// Short-lived negative cache for targets the tunnel-node reported as
+    /// unreachable (`Network is unreachable` / `No route to host`). Keyed by
+    /// `(host, port)`, value is the expiry instant. Plain Mutex<HashMap> is
+    /// fine: it's touched once per CONNECT (cheap) and once per failure.
+    unreachable_cache: Mutex<HashMap<(String, u16), Instant>>,
 }
 
 impl TunnelMux {
     pub fn start(fronter: Arc<DomainFronter>) -> Arc<Self> {
-        let n = fronter.num_scripts();
+        // Dedupe before snapshotting: the aggregate `all_legacy` gate
+        // compares `legacy_deployments.len()` (a HashMap, so unique
+        // keys) against this count, so using the raw `num_scripts()`
+        // would make the gate unreachable whenever a user lists the
+        // same script_id twice in config.
+        let unique: std::collections::HashSet<&str> = fronter
+            .script_id_list()
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let unique_n = unique.len();
+        let raw_n = fronter.num_scripts();
+        if unique_n != raw_n {
+            tracing::warn!(
+                "tunnel mux: {} deployments configured but only {} unique script_id(s) — duplicate entries ignored for legacy detection",
+                raw_n,
+                unique_n,
+            );
+        }
         tracing::info!(
             "tunnel mux: {} deployment(s), {} concurrent per deployment",
-            n,
+            unique_n,
             CONCURRENCY_PER_DEPLOYMENT
         );
         let (tx, rx) = mpsc::channel(512);
@@ -164,13 +285,16 @@ impl TunnelMux {
         Arc::new(Self {
             tx,
             connect_data_unsupported: Arc::new(AtomicBool::new(false)),
-            server_no_longpoll: Arc::new(AtomicBool::new(false)),
+            legacy_deployments: Mutex::new(HashMap::new()),
+            all_legacy: Arc::new(AtomicBool::new(false)),
+            num_scripts: unique_n,
             preread_win: AtomicU64::new(0),
             preread_loss: AtomicU64::new(0),
             preread_skip_port: AtomicU64::new(0),
             preread_skip_unsupported: AtomicU64::new(0),
             preread_win_total_us: AtomicU64::new(0),
             preread_total_events: AtomicU64::new(0),
+            unreachable_cache: Mutex::new(HashMap::new()),
         })
     }
 
@@ -193,7 +317,8 @@ impl TunnelMux {
         })
         .await;
         match reply_rx.await {
-            Ok(r) => r,
+            Ok(Ok((resp, _script_id))) => Ok(resp),
+            Ok(Err(e)) => Err(e),
             Err(_) => Err("mux channel closed".into()),
         }
     }
@@ -207,7 +332,8 @@ impl TunnelMux {
         })
         .await;
         match reply_rx.await {
-            Ok(r) => r,
+            Ok(Ok((resp, _script_id))) => Ok(resp),
+            Ok(Err(e)) => Err(e),
             Err(_) => Err("mux channel closed".into()),
         }
     }
@@ -231,17 +357,145 @@ impl TunnelMux {
         }
     }
 
-    fn server_no_longpoll(&self) -> bool {
-        self.server_no_longpoll.load(Ordering::Relaxed)
+    /// True only when *every* known deployment is currently in legacy
+    /// mode. Both per-session decisions in `tunnel_loop` (the 30 s
+    /// read-timeout backoff and the skip-empty-when-idle short-circuit)
+    /// gate on this aggregate — they can't pick a per-deployment answer
+    /// ahead of time because the next op's deployment is chosen by
+    /// `next_script_id()` only when the batch fires. With one
+    /// long-poll-capable peer still around, the loop must keep emitting
+    /// empty polls so round-robin lands some on that peer (where the
+    /// server can hold them open and deliver pushed bytes).
+    ///
+    /// Known limitation: the comparison is against *all configured*
+    /// deployments (`num_scripts`), not currently-selectable ones. A
+    /// fleet where most deployments are blacklisted in `DomainFronter`
+    /// (10 min cooldown) and the only selectable deployment(s) are
+    /// legacy will keep the fast cadence for up to that cooldown, even
+    /// though every reachable peer is legacy. Accepted because
+    /// integrating the blacklist would require a hot-path query on the
+    /// fronter's mutex once per `tunnel_loop` iteration; a heavily-
+    /// blacklisted fleet has bigger problems than quota optimization,
+    /// and the worst-case quota cost is bounded by the cooldown.
+    ///
+    /// Hot path: lock-free relaxed load. If the cached value is `true`,
+    /// double-check under the mutex with a sweep for expired entries —
+    /// otherwise stale legacy marks would keep us in the slow path forever
+    /// after every deployment recovers (the `mark_server_no_longpoll` sweep
+    /// only fires on the next mark, which may never come).
+    fn all_servers_legacy(&self) -> bool {
+        if !self.all_legacy.load(Ordering::Relaxed) {
+            return false;
+        }
+        let now = Instant::now();
+        let mut deps = match self.legacy_deployments.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        deps.retain(|_, marked_at| now.duration_since(*marked_at) < LEGACY_RECOVER_AFTER);
+        let still_all = deps.len() == self.num_scripts;
+        if !still_all {
+            self.all_legacy.store(false, Ordering::Relaxed);
+        }
+        still_all
     }
 
-    fn mark_server_no_longpoll(&self) {
-        if !self.server_no_longpoll.swap(true, Ordering::Relaxed) {
+    fn mark_server_no_longpoll(&self, script_id: &str) {
+        let now = Instant::now();
+        let mut deps = match self.legacy_deployments.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        // Inline expiry sweep: if any entry has aged past
+        // LEGACY_RECOVER_AFTER, drop it before recomputing `all_legacy`.
+        // Without this, an entry that should have recovered would still
+        // count toward the aggregate.
+        deps.retain(|_, marked_at| now.duration_since(*marked_at) < LEGACY_RECOVER_AFTER);
+        let was_present = deps.contains_key(script_id);
+        deps.insert(script_id.to_string(), now);
+        let all = deps.len() == self.num_scripts;
+        // Atomic written under the lock and *after* the map insert. Any
+        // reader that observes `all_legacy = true` has seen a complete
+        // map state where every deployment is marked.
+        self.all_legacy.store(all, Ordering::Relaxed);
+        drop(deps);
+        // Only log on first-mark-for-this-cycle: after `LEGACY_RECOVER_AFTER`
+        // expiry + re-detection we re-log, which is intentional — that's
+        // a real signal that the deployment regressed back to legacy mode.
+        if !was_present {
+            let short = &script_id[..script_id.len().min(8)];
             tracing::warn!(
-                "tunnel-node returned an empty poll faster than {:?}; assuming legacy (no long-poll) drain — falling back to skip-empty-when-idle to avoid quota waste",
+                "tunnel-node deployment {}... returned an empty poll faster than {:?}; assuming legacy (no long-poll) drain — this deployment will skip empty polls when idle for the next {:?}",
+                short,
                 LEGACY_DETECT_THRESHOLD,
+                LEGACY_RECOVER_AFTER,
             );
         }
+    }
+
+    /// Returns true if `(host, port)` has a non-expired unreachable entry.
+    /// The proxy front-end uses this to skip the tunnel and reply
+    /// "host unreachable" immediately on follow-up CONNECTs.
+    pub fn is_unreachable(&self, host: &str, port: u16) -> bool {
+        let now = Instant::now();
+        let mut cache = match self.unreachable_cache.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let key = (normalize_cache_host(host), port);
+        match cache.get(&key) {
+            Some(expiry) if *expiry > now => true,
+            Some(_) => {
+                cache.remove(&key);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// If `err` looks like a network-unreachable / no-route-to-host error
+    /// from the tunnel-node, remember the target for `UNREACHABLE_CACHE_TTL`.
+    /// No-op for any other error (timeouts, refused, EOF, etc.) — those can
+    /// be transient and we don't want to lock out a host on a flaky moment.
+    fn record_unreachable_if_match(&self, host: &str, port: u16, err: &str) {
+        if !is_unreachable_error_str(err) {
+            return;
+        }
+        let mut cache = match self.unreachable_cache.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        // Cap enforcement is two-stage: first drop anything already expired,
+        // then if we're STILL at/above the cap (i.e. an unbounded burst of
+        // unique unreachable hosts within the TTL), evict the entry that
+        // would expire soonest. This bounds the map size at all times — a
+        // pure `retain` on expiry alone would let the map grow unbounded
+        // until the first entry's TTL elapses.
+        if cache.len() >= UNREACHABLE_CACHE_MAX {
+            let now = Instant::now();
+            cache.retain(|_, expiry| *expiry > now);
+            while cache.len() >= UNREACHABLE_CACHE_MAX {
+                let victim = cache
+                    .iter()
+                    .min_by_key(|(_, expiry)| **expiry)
+                    .map(|(k, _)| k.clone());
+                match victim {
+                    Some(k) => {
+                        cache.remove(&k);
+                    }
+                    None => break,
+                }
+            }
+        }
+        let key = (normalize_cache_host(host), port);
+        cache.insert(key, Instant::now() + UNREACHABLE_CACHE_TTL);
+        tracing::debug!(
+            "negative-cached {}:{} for {:?} ({})",
+            host,
+            port,
+            UNREACHABLE_CACHE_TTL,
+            err
+        );
     }
 
     fn record_preread_win(&self, port: u16, elapsed: Duration) {
@@ -319,19 +573,34 @@ async fn mux_loop(mut rx: mpsc::Receiver<MuxMsg>, fronter: Arc<DomainFronter>) {
 
     loop {
         let mut msgs = Vec::new();
-        match tokio::time::timeout(Duration::from_millis(30), rx.recv()).await {
-            Ok(Some(msg)) => msgs.push(msg),
-            Ok(None) => break,
-            Err(_) => continue,
+        // Block on the first message — no point waking up to find an empty
+        // queue. Once the first op lands, we hold open BATCH_COALESCE_WINDOW
+        // so concurrent ops (parallel fetches, HTTP/2 stream openings, etc.)
+        // land in the same batch instead of getting a fresh round-trip each.
+        match rx.recv().await {
+            Some(msg) => msgs.push(msg),
+            None => break,
         }
-        while let Ok(msg) = rx.try_recv() {
-            msgs.push(msg);
+        let deadline = tokio::time::Instant::now() + BATCH_COALESCE_WINDOW;
+        loop {
+            // Drain anything that's already queued without waiting.
+            while let Ok(msg) = rx.try_recv() {
+                msgs.push(msg);
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            match tokio::time::timeout(deadline - now, rx.recv()).await {
+                Ok(Some(msg)) => msgs.push(msg),
+                Ok(None) => return,
+                Err(_) => break,
+            }
         }
 
         // Split: plain connects go parallel, data-bearing ops get batched.
         let mut data_ops: Vec<BatchOp> = Vec::new();
-        let mut data_replies: Vec<(usize, oneshot::Sender<Result<TunnelResponse, String>>)> =
-            Vec::new();
+        let mut data_replies: Vec<(usize, BatchedReply)> = Vec::new();
         let mut close_sids: Vec<String> = Vec::new();
         let mut batch_payload_bytes: usize = 0;
 
@@ -527,7 +796,7 @@ async fn fire_batch(
     sems: &Arc<HashMap<String, Arc<Semaphore>>>,
     fronter: &Arc<DomainFronter>,
     data_ops: Vec<BatchOp>,
-    data_replies: Vec<(usize, oneshot::Sender<Result<TunnelResponse, String>>)>,
+    data_replies: Vec<(usize, BatchedReply)>,
 ) {
     let script_id = fronter.next_script_id();
     let sem = sems
@@ -558,23 +827,111 @@ async fn fire_batch(
 
         match result {
             Ok(Ok(batch_resp)) => {
+                f.record_batch_success(&script_id);
+                // Wire the Full-mode usage counter that #230 / #362 flagged
+                // as stuck-at-zero. Each successful batch is one
+                // `UrlFetchApp.fetch()` call against the deploying Google
+                // account's daily quota — bytes-counted is the inbound JSON
+                // response which is the closest analogue to the apps_script
+                // path's `record_today(bytes_received)` (we don't have the
+                // exact response byte count post-deserialize, so we use a
+                // proxy: sum of per-session response payload bytes the
+                // batch carried back). Underestimates by JSON envelope
+                // overhead but is in the right order of magnitude.
+                let response_bytes: u64 = batch_resp
+                    .r
+                    .iter()
+                    .map(|r| {
+                        // `d` carries TCP payload (base64 string len ≈
+                        // 4/3 of decoded bytes; close enough); `pkts`
+                        // carries UDP datagrams (each base64); plus any
+                        // error string. Sum gives a stable proxy for
+                        // "how much did this batch move."
+                        let d = r.d.as_ref().map(|s| s.len() as u64).unwrap_or(0);
+                        let pkts = r
+                            .pkts
+                            .as_ref()
+                            .map(|v| v.iter().map(|p| p.len() as u64).sum::<u64>())
+                            .unwrap_or(0);
+                        d + pkts
+                    })
+                    .sum();
+                f.record_today(response_bytes);
+                let sid_short = &script_id[..script_id.len().min(8)];
                 for (idx, reply) in data_replies {
                     if let Some(resp) = batch_resp.r.get(idx) {
-                        let _ = reply.send(Ok(resp.clone()));
+                        let _ = reply.send(Ok((resp.clone(), script_id.clone())));
                     } else {
-                        let _ = reply.send(Err("missing response in batch".into()));
+                        let _ = reply.send(Err(format!(
+                            "missing response in batch from script {}",
+                            sid_short
+                        )));
                     }
                 }
             }
             Ok(Err(e)) => {
+                // Read-side timeout from `domain_fronter`: Apps Script didn't
+                // start streaming response bytes within the per-read deadline.
+                // Common cause: deployment's `TUNNEL_SERVER_URL` points at a
+                // dead host, so UrlFetchApp inside Apps Script hangs until its
+                // own internal connect timeout. Strike-counter blacklists the
+                // deployment after a sustained pattern.
+                if matches!(e, FronterError::Timeout) {
+                    f.record_timeout_strike(&script_id);
+                }
                 let err_msg = format!("{}", e);
-                tracing::warn!("batch failed: {}", err_msg);
+                let sid_short = &script_id[..script_id.len().min(8)];
+                // Detect the body string we ship as the v1.8.0 bad-auth
+                // decoy. v1.8.1 asserted "AUTH_KEY mismatch" outright, but
+                // #404 (w0l4i) found the same body comes back from Apps
+                // Script in 3 other unrelated cases too:
+                //
+                //   1. AUTH_KEY mismatch                 — our intentional decoy
+                //   2. Apps Script execution timeout/    — runtime hit 6-min
+                //      mid-call quota tear                 cap or per-100s quota
+                //   3. Apps Script internal hiccup       — Google-side flake,
+                //                                          serves placeholder
+                //   4. ISP-side response truncation      — #313 pattern, the
+                //                                          response was assembled
+                //                                          but ate an RST mid-flight
+                //
+                // So we surface all four candidates instead of asserting #1.
+                // Users can flip DIAGNOSTIC_MODE=true in Code.gs to disambiguate:
+                // only #1 still returns the decoy in diagnostic mode; the
+                // others return real JSON or different errors.
+                if err_msg.contains("The script completed but did not return anything") {
+                    tracing::error!(
+                        "batch failed (script {}): got the v1.8.0 decoy/placeholder body — \
+                         could be (1) AUTH_KEY mismatch between mhrv-rs config and Code.gs \
+                         (run a direct curl probe against the deployment to verify), \
+                         (2) Apps Script execution timeout or per-100s quota tear (try \
+                         lowering parallel_concurrency in config), (3) Apps Script \
+                         internal hiccup (transient, retry next batch), or (4) ISP-side \
+                         response truncation (#313 pattern, try a different google_ip). \
+                         To distinguish (1) from the rest: set DIAGNOSTIC_MODE=true at \
+                         the top of Code.gs + redeploy as new version — only AUTH_KEY \
+                         mismatch returns this body in diagnostic mode.",
+                        sid_short
+                    );
+                } else {
+                    tracing::warn!("batch failed (script {}): {}", sid_short, err_msg);
+                }
                 for (_, reply) in data_replies {
                     let _ = reply.send(Err(err_msg.clone()));
                 }
             }
             Err(_) => {
-                tracing::warn!("batch timed out after {:?} ({} ops)", BATCH_TIMEOUT, n_ops);
+                // Whole-batch budget (`BATCH_TIMEOUT`, 30 s) elapsed. Even
+                // stronger signal than a per-read timeout — count it the same
+                // way so a truly-stuck deployment exits round-robin fast.
+                f.record_timeout_strike(&script_id);
+                let sid_short = &script_id[..script_id.len().min(8)];
+                tracing::warn!(
+                    "batch timed out after {:?} (script {}, {} ops)",
+                    BATCH_TIMEOUT,
+                    sid_short,
+                    n_ops
+                );
                 for (_, reply) in data_replies {
                     let _ = reply.send(Err("batch timed out".into()));
                 }
@@ -697,6 +1054,11 @@ async fn connect_plain(host: &str, port: u16, mux: &Arc<TunnelMux>) -> std::io::
         Ok(Ok(resp)) => {
             if let Some(ref e) = resp.e {
                 tracing::error!("tunnel connect error for {}:{}: {}", host, port, e);
+                // Only cache here: `resp.e` is the tunnel-node's own connect()
+                // result against the target. The outer `Ok(Err(_))` arm below
+                // is a transport-level failure (relay → Apps Script → tunnel-
+                // node never reached) and tells us nothing about the target.
+                mux.record_unreachable_if_match(host, port, e);
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::ConnectionRefused,
                     e.clone(),
@@ -736,13 +1098,16 @@ async fn connect_with_initial_data(
     .await;
 
     let resp = match reply_rx.await {
-        Ok(Ok(resp)) => resp,
+        Ok(Ok((resp, _script_id))) => resp,
         Ok(Err(e)) => {
             if is_connect_data_unsupported_error_str(&e) {
                 tracing::debug!("connect_data unsupported for {}:{}: {}", host, port, e);
                 return Ok(ConnectDataOutcome::Unsupported);
             }
             tracing::error!("tunnel connect_data error for {}:{}: {}", host, port, e);
+            // Outer transport failure (relay/Apps Script never reached the
+            // tunnel-node). Don't poison the destination cache from here —
+            // see `connect_plain` for the same reasoning.
             return Err(std::io::Error::new(
                 std::io::ErrorKind::ConnectionRefused,
                 e,
@@ -768,6 +1133,8 @@ async fn connect_with_initial_data(
 
     if let Some(ref e) = resp.e {
         tracing::error!("tunnel connect_data error for {}:{}: {}", host, port, e);
+        // `resp.e` is the tunnel-node's own connect result — cache it.
+        mux.record_unreachable_if_match(host, port, e);
         return Err(std::io::Error::new(
             std::io::ErrorKind::ConnectionRefused,
             e.clone(),
@@ -834,18 +1201,30 @@ async fn tunnel_loop(
         // drains. With long-poll, the server holds empty polls open up
         // to its `LONGPOLL_DEADLINE` (~5 s currently), so the client
         // can keep this read timeout short — the wait is on the wire,
-        // not here. Against a *legacy* tunnel-node (no long-poll, fast
+        // not here. Against *legacy* tunnel-nodes (no long-poll, fast
         // empty replies), the same short cadence + always-poll behavior
         // would generate continuous round-trips on idle sessions and
-        // burn Apps Script quota. The `server_no_longpoll` flag detects
-        // the legacy case from reply latency below and reverts to the
-        // pre-long-poll cadence: long sleep on local read, skip empty
-        // polls when sustained-idle.
-        let legacy_mode = mux.server_no_longpoll();
+        // burn Apps Script quota.
+        //
+        // Both the read timeout and the skip-empty-when-idle decision
+        // are gated on `all_legacy` — i.e. *every known deployment is
+        // currently legacy*. Per-deployment "skip when this script is
+        // legacy" sounds appealing but is unsafe: the next op's
+        // deployment is chosen by `next_script_id()` only when the
+        // batch fires, so the loop can't predict where the empty poll
+        // will land. Suppressing polls based on the *previous* reply's
+        // script would stall remote→client data on mixed setups —
+        // round-robin would never reach the long-poll-capable peer for
+        // this session if every iteration short-circuits before
+        // sending. Cost of the conservative gate: legacy peers see
+        // some wasted empty polls when at least one peer is healthy,
+        // bounded by round-robin fan-out. Worth it to keep pushed
+        // bytes flowing.
+        let all_legacy = mux.all_servers_legacy();
         let client_data = if let Some(data) = pending_client_data.take() {
             Some(data)
         } else {
-            let read_timeout = match (legacy_mode, consecutive_empty) {
+            let read_timeout = match (all_legacy, consecutive_empty) {
                 (_, 0) => Duration::from_millis(20),
                 (_, 1) => Duration::from_millis(80),
                 (_, 2) => Duration::from_millis(200),
@@ -864,13 +1243,13 @@ async fn tunnel_loop(
             }
         };
 
-        // Legacy-server skip: against a non-long-polling tunnel-node,
-        // an empty poll is wasted work — fast-empty reply, no push
-        // delivery benefit. Preserve the pre-long-poll behavior of
-        // going quiet after a few empties. Long-poll-capable servers
-        // skip this branch and always send the empty op so the server
-        // can hold it open.
-        if legacy_mode && client_data.is_none() && consecutive_empty > 3 {
+        // Skip empty polls only when *every* deployment is legacy. With
+        // even one long-poll-capable peer, round-robin will land some
+        // empty polls there where the server holds them open and can
+        // deliver pushed bytes — that's the whole point of long-poll,
+        // so we must keep emitting. See the `all_legacy` comment above
+        // for why a per-deployment gate here would stall mixed setups.
+        if all_legacy && client_data.is_none() && consecutive_empty > 3 {
             continue;
         }
 
@@ -889,8 +1268,8 @@ async fn tunnel_loop(
         // Bounded-wait on reply: if the batch this op landed in is slow
         // (dead target on the tunnel-node side), don't block this session
         // forever — timeout and let it retry on the next tick.
-        let resp = match tokio::time::timeout(REPLY_TIMEOUT, reply_rx).await {
-            Ok(Ok(Ok(r))) => r,
+        let (resp, script_id) = match tokio::time::timeout(REPLY_TIMEOUT, reply_rx).await {
+            Ok(Ok(Ok((r, sid_used)))) => (r, sid_used),
             Ok(Ok(Err(e))) => {
                 tracing::debug!("tunnel data error: {}", e);
                 break;
@@ -903,18 +1282,18 @@ async fn tunnel_loop(
             }
         };
 
-        // Legacy-server detection: an empty-in/empty-out round trip
-        // that finishes well under `LEGACY_DETECT_THRESHOLD` is
+        // Per-deployment legacy detection: an empty-in/empty-out round
+        // trip that finishes well under `LEGACY_DETECT_THRESHOLD` is
         // structurally impossible on a long-poll-capable tunnel-node
         // (the server holds the response either until data arrives or
-        // until its long-poll deadline). One observation flips the
-        // sticky flag for the rest of this process. Skip the check
-        // once already in legacy mode — the comparison is cheap, but
-        // calling `mark_server_no_longpoll` repeatedly muddies logs.
-        if !legacy_mode && was_empty_poll {
+        // until its long-poll deadline). One observation marks *this
+        // specific* deployment as legacy for `LEGACY_RECOVER_AFTER`;
+        // peers stay on the fast path. The aggregate `all_legacy` gate
+        // only flips once *every* deployment has been so marked.
+        if was_empty_poll {
             let reply_was_empty = resp.d.as_deref().map(str::is_empty).unwrap_or(true);
             if reply_was_empty && send_at.elapsed() < LEGACY_DETECT_THRESHOLD {
-                mux.mark_server_no_longpoll();
+                mux.mark_server_no_longpoll(&script_id);
             }
         }
 
@@ -1070,6 +1449,133 @@ mod tests {
     }
 
     #[test]
+    fn unreachable_error_str_matches_expected_variants() {
+        assert!(is_unreachable_error_str(
+            "connect failed: Network is unreachable (os error 101)"
+        ));
+        assert!(is_unreachable_error_str("No route to host"));
+        assert!(is_unreachable_error_str("os error 113"));
+        // Case-insensitive.
+        assert!(is_unreachable_error_str(
+            "CONNECT FAILED: NETWORK IS UNREACHABLE"
+        ));
+    }
+
+    #[test]
+    fn unreachable_error_str_rejects_unrelated() {
+        assert!(!is_unreachable_error_str("connection refused"));
+        assert!(!is_unreachable_error_str("connect timed out"));
+        assert!(!is_unreachable_error_str("connection reset by peer"));
+        assert!(!is_unreachable_error_str(""));
+    }
+
+    #[test]
+    fn negative_cache_records_and_short_circuits() {
+        let (mux, _rx) = mux_for_test();
+        // Initially nothing is cached.
+        assert!(!mux.is_unreachable("ds6.probe.example", 443));
+        // Record a matching error.
+        mux.record_unreachable_if_match(
+            "ds6.probe.example",
+            443,
+            "connect failed: Network is unreachable (os error 101)",
+        );
+        assert!(mux.is_unreachable("ds6.probe.example", 443));
+        // A different port for the same host is its own entry.
+        assert!(!mux.is_unreachable("ds6.probe.example", 80));
+    }
+
+    #[test]
+    fn negative_cache_ignores_non_unreachable_errors() {
+        let (mux, _rx) = mux_for_test();
+        mux.record_unreachable_if_match(
+            "example.com",
+            443,
+            "connect failed: connection refused",
+        );
+        assert!(!mux.is_unreachable("example.com", 443));
+    }
+
+    #[test]
+    fn negative_cache_normalizes_host_keys() {
+        let (mux, _rx) = mux_for_test();
+        // Cache under one casing/format...
+        mux.record_unreachable_if_match(
+            "Example.COM.",
+            443,
+            "Network is unreachable (os error 101)",
+        );
+        // ...and look up under several equivalent forms.
+        assert!(mux.is_unreachable("example.com", 443));
+        assert!(mux.is_unreachable("EXAMPLE.com", 443));
+        assert!(mux.is_unreachable("example.com.", 443));
+        // Different host should still miss.
+        assert!(!mux.is_unreachable("other.com", 443));
+    }
+
+    /// Outer `Ok(Err(_))` from the mux channel means "the relay never
+    /// reached the tunnel-node" (HTTP/TLS to Apps Script failed, batch
+    /// timed out, etc.) — the destination wasn't even attempted. Even if
+    /// that error string contains "Network is unreachable" (e.g. the
+    /// client device's WAN was momentarily down), it must NOT poison the
+    /// destination cache, or every host the user touched during a
+    /// connectivity blip stays refused for 30s.
+    #[tokio::test]
+    async fn negative_cache_skips_outer_relay_errors() {
+        let (mux, mut rx) = mux_for_test();
+        let mux_for_task = mux.clone();
+        let task = tokio::spawn(async move {
+            connect_plain("real.target.example", 443, &mux_for_task).await
+        });
+
+        // Receive the Connect msg and reply with an outer Err whose string
+        // would otherwise match `is_unreachable_error_str`.
+        let msg = rx.recv().await.expect("connect msg");
+        let reply = match msg {
+            MuxMsg::Connect { reply, .. } => reply,
+            other => panic!("expected Connect, got {:?}", std::mem::discriminant(&other)),
+        };
+        let _ = reply.send(Err(
+            "relay failed: Network is unreachable (os error 101)".into(),
+        ));
+
+        let res = task.await.expect("task");
+        assert!(res.is_err(), "connect_plain should surface the error");
+        assert!(
+            !mux.is_unreachable("real.target.example", 443),
+            "outer relay error must not negative-cache the destination"
+        );
+    }
+
+    #[test]
+    fn negative_cache_enforces_hard_cap_under_unique_burst() {
+        let (mux, _rx) = mux_for_test();
+        // Insert enough unique still-live entries to exceed the cap. The
+        // map size must never exceed UNREACHABLE_CACHE_MAX, even though
+        // every entry is fresh and `retain(expired)` prunes nothing.
+        let burst = UNREACHABLE_CACHE_MAX + 50;
+        for i in 0..burst {
+            let host = format!("h{}.example", i);
+            mux.record_unreachable_if_match(
+                &host,
+                443,
+                "connect failed: Network is unreachable (os error 101)",
+            );
+        }
+        let len = mux
+            .unreachable_cache
+            .lock()
+            .map(|g| g.len())
+            .unwrap_or(0);
+        assert!(
+            len <= UNREACHABLE_CACHE_MAX,
+            "cache size {} exceeded cap {}",
+            len,
+            UNREACHABLE_CACHE_MAX
+        );
+    }
+
+    #[test]
     fn server_speaks_first_covers_common_protocols() {
         for p in [21u16, 22, 25, 80, 110, 143, 587] {
             assert!(
@@ -1091,17 +1597,28 @@ mod tests {
     /// than wired to a real DomainFronter. Lets tests assert what messages
     /// the client would emit without needing network or apps_script.
     fn mux_for_test() -> (Arc<TunnelMux>, mpsc::Receiver<MuxMsg>) {
+        mux_for_test_with(2)
+    }
+
+    /// Build a TunnelMux for tests with a specific deployment count. The
+    /// per-deployment legacy state's aggregate gate (`all_servers_legacy`)
+    /// requires `legacy_deployments.len() == num_scripts`, so tests that
+    /// exercise that gate need to control how many "deployments" exist.
+    fn mux_for_test_with(num_scripts: usize) -> (Arc<TunnelMux>, mpsc::Receiver<MuxMsg>) {
         let (tx, rx) = mpsc::channel(16);
         let mux = Arc::new(TunnelMux {
             tx,
             connect_data_unsupported: Arc::new(AtomicBool::new(false)),
-            server_no_longpoll: Arc::new(AtomicBool::new(false)),
+            legacy_deployments: Mutex::new(HashMap::new()),
+            all_legacy: Arc::new(AtomicBool::new(false)),
+            num_scripts,
             preread_win: AtomicU64::new(0),
             preread_loss: AtomicU64::new(0),
             preread_skip_port: AtomicU64::new(0),
             preread_skip_unsupported: AtomicU64::new(0),
             preread_win_total_us: AtomicU64::new(0),
             preread_total_events: AtomicU64::new(0),
+            unreachable_cache: Mutex::new(HashMap::new()),
         });
         (mux, rx)
     }
@@ -1144,14 +1661,17 @@ mod tests {
                 assert_eq!(sid, "sid-under-test");
                 assert_eq!(&data[..], b"CLIENTHELLO");
                 // Reply with eof so tunnel_loop unwinds cleanly.
-                let _ = reply.send(Ok(TunnelResponse {
-                    sid: Some("sid-under-test".into()),
-                    d: None,
-                    pkts: None,
-                    eof: Some(true),
-                    e: None,
-                    code: None,
-                }));
+                let _ = reply.send(Ok((
+                    TunnelResponse {
+                        sid: Some("sid-under-test".into()),
+                        d: None,
+                        pkts: None,
+                        eof: Some(true),
+                        e: None,
+                        code: None,
+                    },
+                    "test-script".to_string(),
+                )));
             }
             other => panic!(
                 "first mux message was not Data (expected replay); got {:?}",
@@ -1164,6 +1684,81 @@ mod tests {
                     MuxMsg::Close { .. } => "Close",
                 }
             ),
+        }
+
+        let _ = tokio::time::timeout(Duration::from_secs(2), loop_handle)
+            .await
+            .expect("tunnel_loop did not exit after eof");
+    }
+
+    /// Regression for the mixed-mode stall: A is legacy, B is long-poll
+    /// capable, the session's last reply came from A. A naive per-
+    /// deployment skip (gated on the *previous* reply's `script_id`)
+    /// would short-circuit every empty poll on this session — so B
+    /// never gets a chance to long-poll for us, and remote→client data
+    /// stalls until either the local client sends bytes or A's TTL
+    /// expires. The fix gates skip-when-idle on the aggregate
+    /// `all_servers_legacy()` instead, so the loop keeps emitting empty
+    /// polls whenever at least one peer can still hold the request open.
+    /// Replies are paced via `start_paused` time auto-advance — without
+    /// it the test would take ~2 s of real wall-clock time per session.
+    #[tokio::test(start_paused = true)]
+    async fn tunnel_loop_keeps_polling_when_only_some_deployments_legacy() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let _client = TcpStream::connect(addr).await.unwrap();
+        let mut server_side = accept.await.unwrap();
+
+        // 2 deployments, only A marked legacy → all_servers_legacy = false.
+        let (mux, mut rx) = mux_for_test_with(2);
+        mux.mark_server_no_longpoll("script-A");
+        assert!(!mux.all_servers_legacy());
+
+        let loop_handle = tokio::spawn({
+            let mux = mux.clone();
+            async move { tunnel_loop(&mut server_side, "sid-mixed", &mux, None).await }
+        });
+
+        // Reply to 6 empty polls, all from A. With the regression
+        // (per-deployment skip on `last_script_id == A`), the loop would
+        // stop emitting at iteration 4 — `consecutive_empty > 3` plus
+        // `last_was_legacy` would short-circuit the send. With the fix,
+        // the aggregate gate stays false and the loop keeps polling.
+        // The 60 s timeout below is paused-time, so it only "elapses"
+        // if rx.recv() truly never resolves (i.e. the loop has stalled).
+        for i in 0..6u32 {
+            let msg = tokio::time::timeout(Duration::from_secs(60), rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!(
+                    "loop stopped emitting at iteration {} — regression: per-deployment skip-when-idle stalled session even though long-poll-capable peer was available",
+                    i
+                ))
+                .expect("mux channel closed unexpectedly");
+            match msg {
+                MuxMsg::Data { sid, data, reply } => {
+                    assert_eq!(sid, "sid-mixed");
+                    assert!(data.is_empty(), "expected empty poll, got {} bytes", data.len());
+                    let last = i == 5;
+                    let _ = reply.send(Ok((
+                        TunnelResponse {
+                            sid: Some("sid-mixed".into()),
+                            d: None,
+                            pkts: None,
+                            eof: if last { Some(true) } else { None },
+                            e: None,
+                            code: None,
+                        },
+                        "script-A".to_string(),
+                    )));
+                }
+                _ => panic!(
+                    "iteration {}: expected Data poll, got a different MuxMsg variant",
+                    i
+                ),
+            }
         }
 
         let _ = tokio::time::timeout(Duration::from_secs(2), loop_handle)
@@ -1185,19 +1780,109 @@ mod tests {
         assert!(mux.connect_data_unsupported());
     }
 
-    /// `server_no_longpoll` must be sticky too: once we see a legacy
-    /// fast-empty reply, every subsequent session uses the legacy idle
-    /// cadence (long read timeout + skip-empty) for the rest of the
-    /// process. Flipping it back per-session would either thrash the
-    /// cadence or double the detection cost.
+    /// Marking deployment A as legacy must NOT make B look legacy. This
+    /// is the central guarantee of the per-deployment design: with the
+    /// old global AtomicBool, one slow / legacy deployment dragged every
+    /// session onto the 30 s legacy cadence even when the other 7 were
+    /// long-polling fine.
     #[test]
-    fn no_longpoll_cache_is_sticky() {
-        let (mux, _rx) = mux_for_test();
-        assert!(!mux.server_no_longpoll());
-        mux.mark_server_no_longpoll();
-        assert!(mux.server_no_longpoll());
-        mux.mark_server_no_longpoll(); // idempotent
-        assert!(mux.server_no_longpoll());
+    fn legacy_state_is_per_deployment() {
+        let (mux, _rx) = mux_for_test_with(2);
+        mux.mark_server_no_longpoll("script-A");
+
+        let deps = mux.legacy_deployments.lock().unwrap();
+        assert!(deps.contains_key("script-A"));
+        assert!(
+            !deps.contains_key("script-B"),
+            "marking A must not insert an entry for B"
+        );
+    }
+
+    /// `all_servers_legacy` (the per-session 30 s read-timeout gate) flips
+    /// to true *only* when every known deployment has been marked. With
+    /// 2 deployments, marking one keeps the gate false; marking both
+    /// flips it true.
+    #[test]
+    fn all_servers_legacy_requires_every_deployment() {
+        let (mux, _rx) = mux_for_test_with(2);
+        assert!(!mux.all_servers_legacy());
+
+        mux.mark_server_no_longpoll("script-A");
+        assert!(
+            !mux.all_servers_legacy(),
+            "1 of 2 marked: aggregate must stay false"
+        );
+
+        mux.mark_server_no_longpoll("script-B");
+        assert!(
+            mux.all_servers_legacy(),
+            "all deployments marked: aggregate flips true"
+        );
+
+        // Idempotent re-mark of an already-legacy deployment doesn't
+        // disturb the aggregate.
+        mux.mark_server_no_longpoll("script-A");
+        assert!(mux.all_servers_legacy());
+    }
+
+    /// After `LEGACY_RECOVER_AFTER`, an entry is treated as expired and
+    /// the deployment rejoins the long-poll fast path. The next mark
+    /// (against any deployment) sweeps stale entries before recomputing
+    /// the aggregate gate, so a recovered peer doesn't keep counting
+    /// toward `all_legacy`. Backdating the mark time avoids a real 60 s
+    /// sleep in the test — same effect as the wall-clock moving forward.
+    #[test]
+    fn legacy_state_recovers_after_ttl() {
+        let (mux, _rx) = mux_for_test_with(2);
+        mux.mark_server_no_longpoll("script-A");
+
+        // Backdate A past LEGACY_RECOVER_AFTER, then mark B. B's mark
+        // must trigger a sweep that drops the stale A entry.
+        {
+            let mut deps = mux.legacy_deployments.lock().unwrap();
+            let stale = Instant::now()
+                .checked_sub(LEGACY_RECOVER_AFTER + Duration::from_secs(1))
+                .expect("test environment should have a non-trivial monotonic clock");
+            deps.insert("script-A".to_string(), stale);
+        }
+        mux.mark_server_no_longpoll("script-B");
+
+        let deps = mux.legacy_deployments.lock().unwrap();
+        assert!(
+            !deps.contains_key("script-A"),
+            "expired entry must be swept on the next mark — otherwise stale legacy state never clears"
+        );
+        assert!(deps.contains_key("script-B"));
+    }
+
+    /// If every deployment is legacy and then time passes past
+    /// `LEGACY_RECOVER_AFTER` *without any new mark*, the aggregate gate
+    /// must self-correct on the next `all_servers_legacy()` call.
+    /// Without the in-place sweep on read, stale legacy marks would keep
+    /// the 30 s read-timeout active forever after every deployment
+    /// recovers.
+    #[test]
+    fn all_servers_legacy_self_corrects_when_entries_expire() {
+        let (mux, _rx) = mux_for_test_with(2);
+        mux.mark_server_no_longpoll("script-A");
+        mux.mark_server_no_longpoll("script-B");
+        assert!(mux.all_servers_legacy());
+
+        // Backdate every entry past TTL.
+        {
+            let mut deps = mux.legacy_deployments.lock().unwrap();
+            let stale = Instant::now()
+                .checked_sub(LEGACY_RECOVER_AFTER + Duration::from_secs(1))
+                .expect("monotonic clock should be far enough along");
+            for (_, t) in deps.iter_mut() {
+                *t = stale;
+            }
+        }
+
+        assert!(
+            !mux.all_servers_legacy(),
+            "aggregate must self-correct when all entries expire — otherwise the 30 s read timeout sticks forever"
+        );
     }
 
     #[test]

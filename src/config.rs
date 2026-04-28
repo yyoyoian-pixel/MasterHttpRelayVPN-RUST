@@ -163,6 +163,87 @@ pub struct Config {
     /// Issues #39, #127.
     #[serde(default)]
     pub passthrough_hosts: Vec<String>,
+
+    /// Block outbound QUIC (UDP/443) at the SOCKS5 listener.
+    ///
+    /// QUIC is HTTP/3-over-UDP. In `apps_script` mode it's hopeless —
+    /// Apps Script is HTTP-only, so QUIC datagrams either get refused
+    /// outright (UDP ASSOCIATE rejected) or silently fall through to
+    /// `raw-tcp direct` and fail in interesting ways. In `full` mode
+    /// the tunnel-node CAN carry UDP, but QUIC's congestion control
+    /// stacked on top of TCP-encapsulated transport produces TCP
+    /// meltdown for any non-trivial bandwidth — browsers see <1 Mbps
+    /// where the same site over plain HTTPS would do >50.
+    ///
+    /// With `block_quic = true`, the SOCKS5 UDP relay drops any
+    /// datagram destined for port 443 (silent UDP — caller's stack
+    /// retries a few times then falls back). Browsers then re-issue
+    /// the same request as TCP/HTTPS through the regular CONNECT
+    /// path, which goes through the relay normally.
+    ///
+    /// Why this is opt-in rather than always-on: for users on Full
+    /// mode + udpgw (a recent path; v1.7.0+) the QUIC TCP-meltdown
+    /// is partially mitigated by udpgw's persistent-socket reuse,
+    /// and a tiny minority of sites only support HTTP/3 (rare). The
+    /// flag lets users who care about consistency over peak speed
+    /// opt out of QUIC at the source rather than discovering its
+    /// failure modes later. Issue #213.
+    #[serde(default)]
+    pub block_quic: bool,
+    /// When true, suppress the random `_pad` field that v1.8.0+ adds
+    /// to outbound Apps Script requests for DPI evasion. Default off
+    /// (padding active). Some users on heavily-throttled ISPs find
+    /// the +25% bandwidth cost from padding compounds with the
+    /// throttle to push borderline-working batches into timeouts;
+    /// turning padding off recovers a bit of headroom at the cost of
+    /// length-distribution defense against DPI fingerprinting. Issue
+    /// #391 (EBRAHIM-AM).
+    ///
+    /// Don't flip this on speculatively — for users where Apps Script
+    /// outbound is uncongested, padding is free DPI defense. Only
+    /// turn off if you've measured throughput improvement after the
+    /// flip on your specific ISP path.
+    #[serde(default)]
+    pub disable_padding: bool,
+
+    /// Opt-out for the DoH bypass. Default `false` (= bypass active):
+    /// CONNECTs to well-known DoH hostnames (Cloudflare, Google, Quad9,
+    /// AdGuard, NextDNS, OpenDNS, browser-pinned variants like
+    /// `chrome.cloudflare-dns.com` and `mozilla.cloudflare-dns.com`)
+    /// skip the Apps Script tunnel and exit via plain TCP (or
+    /// `upstream_socks5` if set). DoH already encrypts the queries
+    /// themselves, so the only privacy property the tunnel was adding
+    /// is hiding *the fact that you're doing DoH* from the local
+    /// network — a marginal gain not worth the ~2 s Apps Script
+    /// round-trip cost paid on every name lookup. In Full mode this
+    /// was the dominant DNS slowdown source.
+    ///
+    /// Set `tunnel_doh: true` to keep DoH inside the tunnel. With the
+    /// bypass off, browsers that find their pinned DoH host
+    /// unreachable already fall back to OS DNS on their own, so
+    /// failure modes are graceful in either direction.
+    ///
+    /// Port-gated to TCP/443 only. A private DoH on a non-standard port
+    /// (e.g. `doh.internal.example:8443`) won't take the bypass path —
+    /// list it in `passthrough_hosts` instead, which has no port gate.
+    #[serde(default)]
+    pub tunnel_doh: bool,
+
+    /// Extra hostnames to treat as DoH endpoints in addition to the
+    /// built-in default list. Case-insensitive; entries match exactly
+    /// OR as a dot-anchored suffix unconditionally — `doh.acme.test`
+    /// covers both `doh.acme.test` and `tenant.doh.acme.test`. (Unlike
+    /// `passthrough_hosts`, no leading dot is required for suffix
+    /// matching: every legitimate subdomain of a DoH host is itself
+    /// a DoH endpoint, so the leading-dot convention would be a
+    /// footgun.) Use this to cover private/enterprise DoH resolvers
+    /// without waiting for a release.
+    ///
+    /// Inert when `tunnel_doh = true` — the bypass itself is off, so
+    /// the extras have nothing to feed. The proxy logs a warning at
+    /// startup if both are set together.
+    #[serde(default)]
+    pub bypass_doh_hosts: Vec<String>,
 }
 
 fn default_fetch_ips_from_api() -> bool { false }
@@ -226,9 +307,11 @@ impl Config {
             ));
         }
         if self.socks5_port == Some(self.listen_port) {
-            return Err(ConfigError::Invalid(
-                "listen_port and socks5_port must be different".into(),
-            ));
+            return Err(ConfigError::Invalid(format!(
+                "listen_port and socks5_port must differ on the same host \
+                 (both set to {} on {}). Change one of them in config.json.",
+                self.listen_port, self.listen_host
+            )));
         }
         Ok(())
     }

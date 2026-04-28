@@ -77,6 +77,17 @@ jobs:
           - target: x86_64-pc-windows-gnu
             os: windows-latest
             name: mhrv-rs-windows-amd64
+          # i686-pc-windows-msvc target was attempted in v1.7.7-v1.7.10
+          # to support Windows 7 32-bit users (#272, #318). Removed in
+          # v1.7.11 because keeping it on Rust 1.77.2 (last Win7-stable)
+          # is fundamentally fragile: every transitive crate that bumps
+          # its MSRV (e.g. `time` 0.3.47 needs Cargo manifest features
+          # only available in Rust 1.78+) breaks the build, and pinning
+          # transitives is brittle across releases. Win7 users should
+          # self-build per the README; the project no longer ships a
+          # prebuilt i686 Win7 binary. Replaced by the existing
+          # x86_64-pc-windows-gnu (windows-amd64) which covers ~99% of
+          # active Windows installs (incl. all WoA64 emulation).
           - target: x86_64-unknown-linux-musl
             os: [self-hosted, linux, x64, mhrv-build]
             name: mhrv-rs-linux-musl-amd64
@@ -138,9 +149,14 @@ jobs:
       # installed and the standard target triples are pre-added. It
       # still verifies the target is present and is cheap enough to keep
       # as a safety net.
-      - uses: dtolnay/rust-toolchain@stable
+      # Per-matrix-entry toolchain selection. Default is `stable` (latest)
+      # for every target except where `rust_toolchain` is explicitly pinned
+      # — currently just i686-pc-windows-msvc, which needs 1.77.2 to keep
+      # the Win7 binary loadable (Rust 1.78+ raised Windows MSRV to Win10).
+      - uses: dtolnay/rust-toolchain@master
         if: matrix.mipsel_softfloat != true
         with:
+          toolchain: ${{ matrix.rust_toolchain || 'stable' }}
           targets: ${{ matrix.target }}
 
       # Cache target/ + cargo registry across runs — this is the big
@@ -159,7 +175,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         if: matrix.mipsel_softfloat != true
         with:
-          key: ${{ matrix.target }}
+          # Include toolchain in the cache key so a pinned-Rust target
+          # (i686-pc-windows-msvc on 1.77.2) doesn't collide with
+          # stable-Rust caches for other targets, and a future toolchain
+          # bump invalidates only the affected slot.
+          key: ${{ matrix.target }}-${{ matrix.rust_toolchain || 'stable' }}
           cache-bin: "false"
 
       # eframe needs a few system libs on Linux for window management, keyboard,
@@ -578,10 +598,33 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
+      # `actions/download-artifact@v4` has been intermittently flaking on
+      # this workflow with "5 retries exhausted" on a single artifact (~10
+      # of 13). Wrap it in a manual retry — usually the second attempt
+      # succeeds, the third nails any laggards. We use `gh run download`
+      # against the current run so we don't depend on the release page
+      # existing yet (it doesn't until the softprops step below runs).
+      - name: Download all build artifacts (with retries)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p dist
+          for attempt in 1 2 3; do
+            if gh run download "${GITHUB_RUN_ID}" --dir dist --repo "${GITHUB_REPOSITORY}"; then
+              echo "downloaded all artifacts on attempt $attempt"
+              # `gh run download` puts each artifact in its own subdir;
+              # flatten so downstream steps that expect dist/<file> work
+              # the same as `merge-multiple: true` did.
+              find dist -type f -mindepth 2 -exec mv -f {} dist/ \;
+              find dist -type d -empty -delete
+              ls -la dist/
+              exit 0
+            fi
+            echo "download attempt $attempt failed; retrying in 30s..."
+            sleep 30
+          done
+          echo "::error::failed to download artifacts after 3 attempts"
+          exit 1
 
       # Compose the GitHub release body from `docs/changelog/v<ver>.md`
       # so the Releases page tells humans what actually changed —
@@ -608,8 +651,22 @@ jobs:
           fi
           {
             echo 'body<<__RELEASE_BODY_EOF__'
-            # Strip leading HTML comment that documents the file format.
-            sed -e '1{/^<!--/d;}' "$CHANGELOG"
+            # Strip leading HTML comment blocks (single-line OR multi-line)
+            # using the SAME regex as
+            # .github/scripts/telegram_release_notify.py:parse_changelog,
+            # so the GitHub Release page and the Telegram post agree on
+            # exactly what counts as "the leading comment block." Both
+            # also strip any leading whitespace/blank lines that follow.
+            #
+            # Quoted heredoc (`<<'PY'`) so backticks/$ in the python
+            # snippet aren't shell-interpolated; CHANGELOG is passed in
+            # as an env var on the python invocation rather than via
+            # `$CHANGELOG` interpolation inside the heredoc.
+            CHANGELOG_PATH="$CHANGELOG" python3 - <<'PY'
+          import os, re, pathlib
+          body = pathlib.Path(os.environ["CHANGELOG_PATH"]).read_text(encoding="utf-8")
+          print(re.sub(r"^\s*(?:<!--.*?-->\s*)+", "", body, count=1, flags=re.S), end="")
+          PY
             echo
             echo '__RELEASE_BODY_EOF__'
           } >> "$GITHUB_OUTPUT"
@@ -636,43 +693,193 @@ jobs:
           append_body: true
           generate_release_notes: true
 
-  # Notify the Persian-speaking Telegram channel with the CI-built
-  # Android APK + its sha256 + the per-version changelog from
-  # `docs/changelog/v<tag>.md`.
+  # Refresh the in-repo `releases/` folder with the latest pre-built
+  # artifacts so users behind GitHub-Releases-page filtering (the IR
+  # state network filters the dynamic /releases/ URL but not the static
+  # `Code → Download ZIP` of the source tree) can still download.
+  # Practice was started pre-v1.1.0, dropped, then resumed at user
+  # request after a Telegram-channel suggestion: "فقط داخل پوشه ریلیز
+  # پروژه اپلود بکن — مشکل دانلود حل میشه — راحت میشه از گیتهاب دانلود
+  # کرد." The folder holds ONLY the latest version (replace, not
+  # archive); each tag refresh overwrites the previous artifacts. The
+  # existing release-page workflow keeps versioned artifacts behind
+  # `https://github.com/.../releases/tag/v...` for users who can reach
+  # that URL — this in-repo folder is the fallback for users who can't.
+  commit-releases:
+    needs: [build, android, release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # Always check out main, not the tag — we're committing back to
+      # the moving branch. fetch-depth 0 so `git push origin HEAD:main`
+      # has the lineage to fast-forward.
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      # Pull artifacts from the GitHub Release page (which the `release`
+      # job populated a few seconds earlier) rather than the workflow
+      # artifacts API. The artifacts API path —
+      # `actions/download-artifact@v4` with `merge-multiple: true` —
+      # has been failing with "artifact download failed after 5
+      # retries" on one of the ~13 artifacts on multiple consecutive
+      # runs (v1.7.5 retrigger, v1.7.6). The 10 fast downloads that
+      # complete first all succeed; the 11th-13th hit the error.
+      # `gh release download` reads from GitHub's Release-page CDN,
+      # which is independent of the artifacts blob store and has a
+      # different retry / rate-limit profile. Same files, more
+      # reliable surface.
+      - name: Download artifacts from the GitHub Release page
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VER="${{ inputs.version || github.ref_name }}"
+          # Strip leading `v` to normalize, then re-add — the Release
+          # tag is `vX.Y.Z`, but for the rest of the workflow we use
+          # bare `X.Y.Z`. Mirror the same pattern here so a downstream
+          # readme update can use the bare version.
+          VER="${VER#v}"
+          mkdir -p artifacts
+          gh release download "v${VER}" \
+            --repo "${{ github.repository }}" \
+            --dir artifacts \
+            --pattern '*.tar.gz' \
+            --pattern '*.zip' \
+            --pattern '*.apk'
+          echo "--- artifacts/ contents ---"
+          ls -la artifacts/
+
+      - name: Refresh releases/ folder
+        run: |
+          set -euo pipefail
+          VER="${{ inputs.version || github.ref_name }}"
+          VER="${VER#v}"
+
+          mkdir -p releases
+
+          # Wipe old binary artifacts (.apk, .tar.gz, .zip) but keep
+          # README.md and .gitattributes — those are folder-level docs
+          # that stay constant across versions and shouldn't be
+          # regenerated on every release.
+          find releases -maxdepth 1 -type f \
+            \( -name '*.apk' -o -name '*.tar.gz' -o -name '*.zip' \) \
+            -delete
+
+          # Copy desktop archives. Their names already include the
+          # platform identifier (mhrv-rs-linux-amd64.tar.gz, etc.) and
+          # are version-stable — no rename needed.
+          for f in artifacts/*.tar.gz artifacts/*.zip; do
+            [ -f "$f" ] || continue
+            cp "$f" "releases/$(basename "$f")"
+          done
+
+          # Android APKs come with the version baked into the name
+          # (mhrv-rs-android-universal-v1.7.5.apk). Copy all of them so
+          # users on slow connections can grab a per-ABI APK (~37 MB)
+          # instead of the universal (~110 MB).
+          for f in artifacts/mhrv-rs-android-*.apk; do
+            [ -f "$f" ] || continue
+            cp "$f" "releases/$(basename "$f")"
+          done
+
+          # Update the "Current version" line in releases/README.md
+          # (both English and Persian copies) and APK filename refs so
+          # the doc stays accurate. `sed -i` BSD/GNU compatibility is
+          # handled by passing an empty extension explicitly — runner
+          # is Linux so `-i` alone works, but the empty-string form
+          # also works on macOS for anyone running this locally.
+          if [ -f releases/README.md ]; then
+            sed -i.bak \
+              -e "s/Current version: \*\*v[0-9][0-9.]*\*\*/Current version: **v${VER}**/" \
+              -e "s/نسخهٔ فعلی: \*\*v[0-9][0-9.]*\*\*/نسخهٔ فعلی: **v${VER}**/" \
+              -e "s/mhrv-rs-android-universal-v[0-9][0-9.]*\.apk/mhrv-rs-android-universal-v${VER}.apk/g" \
+              releases/README.md
+            rm -f releases/README.md.bak
+          fi
+
+          echo "--- releases/ contents after refresh ---"
+          ls -la releases/
+
+      - name: Commit + push to main
+        run: |
+          set -euo pipefail
+          VER="${{ inputs.version || github.ref_name }}"
+          VER="${VER#v}"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add releases
+          if git diff --cached --quiet; then
+            echo "No releases/ changes to commit (artifacts identical to current HEAD?)."
+            exit 0
+          fi
+
+          git commit -m "chore(releases): refresh prebuilt binaries for v${VER}" \
+                     -m "Auto-committed by release workflow so users behind GitHub-Releases-page filtering can download via the in-repo releases/ folder. The GitHub Release page itself still has the canonical versioned artifacts; this folder is the fallback path for users who can only reach the static source tree (Code → Download ZIP)."
+
+          # Push to main. The release workflow runs on the tag commit,
+          # which is reachable from main as a fast-forward — push is
+          # straightforward, no force needed. Tag protection rules
+          # apply to refs/tags/* not refs/heads/main, so this push
+          # isn't gated by the same protection.
+          git push origin HEAD:main
+
+  # ─────────── LEGACY — DORMANT BY DEFAULT ───────────
   #
-  # Two Telegram API calls:
-  #   1. sendDocument — APK file + a short caption (Telegram caps
-  #      captions at 1024 chars, and we have bigger changelogs than
-  #      that).
-  #   2. sendMessage — full changelog as a reply to #1, Persian
-  #      quote-block first then English, same pattern as the
-  #      previous manual post. No emojis, as the user asked.
+  # Posts the universal APK + per-version changelog to the **main**
+  # Telegram channel as one big sendDocument + sendMessage pair.
   #
-  # Needs two repo secrets:
-  #   TELEGRAM_BOT_TOKEN  — bot the channel admits as poster
-  #   TELEGRAM_CHAT_ID    — numeric chat id (starts with -100...)
-  # Missing either => the whole job is skipped (not failed) so a
-  # forker who hasn't set up a Telegram channel gets a clean release.
+  # Superseded as of v1.8.0+ by `.github/workflows/telegram-publish-files.yml`,
+  # which posts each platform's artifact individually to the **files**
+  # channel (with SHA-256 captions) and then a single cross-link
+  # message to the main channel pointing at the files-channel anchor.
+  #
+  # This job stays in the source tree, dormant, in case we ever want
+  # to revert to the bundled-changelog-on-main-channel pattern (or
+  # use both at once during a transition). To turn it back on:
+  #
+  #     gh variable set TELEGRAM_NOTIFY_ENABLED --body true
+  #
+  # Note: with the new workflow active too, that produces TWO posts
+  # to the main channel per release (the legacy APK+changelog *and*
+  # the new cross-link). Pick one.
+  #
+  # Default state is disabled.
   telegram:
     needs: [android, release]
     runs-on: ubuntu-latest
     # Gated on the repo variable `TELEGRAM_NOTIFY_ENABLED`. Default is
-    # OFF — the job skips silently unless the variable is set to the
-    # literal string "true". Toggle via:
-    #
-    #     gh variable set TELEGRAM_NOTIFY_ENABLED --body true
-    #     gh variable set TELEGRAM_NOTIFY_ENABLED --body false
-    #
-    # Keeping the machinery (script + secrets) in place so flipping
-    # the switch back on is a one-liner, not a workflow edit.
+    # off — the job skips silently unless the variable is set to the
+    # literal string "true".
     if: ${{ vars.TELEGRAM_NOTIFY_ENABLED == 'true' && needs.android.result == 'success' }}
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/download-artifact@v4
-        with:
-          name: mhrv-rs-android-universal
-          path: apk
+      # Same retry pattern as the `release` job above — `actions/download-artifact@v4`
+      # has been flaking on this workflow with 5-retries-exhausted errors.
+      - name: Download universal APK (with retries)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p apk
+          for attempt in 1 2 3; do
+            if gh run download "${GITHUB_RUN_ID}" \
+                 --name mhrv-rs-android-universal \
+                 --dir apk \
+                 --repo "${GITHUB_REPOSITORY}"; then
+              echo "downloaded universal APK on attempt $attempt"
+              ls -la apk/
+              exit 0
+            fi
+            echo "download attempt $attempt failed; retrying in 30s..."
+            sleep 30
+          done
+          echo "::error::failed to download universal APK after 3 attempts"
+          exit 1
 
       - name: Post to Telegram
         env:
