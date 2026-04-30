@@ -91,13 +91,23 @@ class MhrvVpnService : VpnService() {
         // path below MUST therefore happen after a `startForeground()`
         // call — otherwise the user-visible symptom is "the app crashes
         // the instant I tap Start". See issue #73.
-        startForeground(NOTIF_ID, buildNotif(cfg.listenPort))
+        // Issue #211: notification used to display
+        // `127.0.0.1:${listenPort + 1}` for the SOCKS5 port, which is
+        // wrong whenever socks5Port doesn't equal listenPort+1. With the
+        // default Android config (listenPort=8080, socks5Port=1081)
+        // users saw "Routing via SOCKS5 127.0.0.1:8081" but the real
+        // listener was on 1081 — so per-app SOCKS5 setup against the
+        // notification value silently failed. Pass the actual socks5Port
+        // (after the same elvis fallback used elsewhere) so the
+        // notification matches reality.
+        val notifSocks5Port = cfg.socks5Port ?: (cfg.listenPort + 1)
+        startForeground(NOTIF_ID, buildNotif(cfg.listenPort, notifSocks5Port))
 
         // Deployment ID + auth key are required for apps_script and full
-        // modes — both talk to Apps Script. Only google_only (bootstrap)
-        // runs without them. Closes #73 regression where google_only
-        // users hit this branch and crashed on startForeground timeout.
-        val needsCreds = cfg.mode != Mode.GOOGLE_ONLY
+        // modes — both talk to Apps Script. Only `direct` mode runs
+        // without them. Closes #73 regression where direct-mode users
+        // hit this branch and crashed on startForeground timeout.
+        val needsCreds = cfg.mode != Mode.DIRECT
         if (needsCreds && (!cfg.hasDeploymentId || cfg.authKey.isBlank())) {
             Log.e(TAG, "Config is incomplete — deployment ID + auth key required for ${cfg.mode}")
             try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Throwable) {}
@@ -242,29 +252,56 @@ class MhrvVpnService : VpnService() {
         tun = parcelFd
 
         // 3) Start tun2proxy on a worker thread. It blocks until stop() or
-        //    shutdown. We detach the fd so ownership transfers cleanly; the
-        //    ParcelFileDescriptor (`tun`) still holds a reference, so closing
-        //    it at teardown reliably tears down the TUN even if tun2proxy
-        //    doesn't cleanly exit.
+        //    shutdown. We detach the fd so ownership transfers cleanly to
+        //    tun2proxy (closeFdOnDrop = true closes it on return from run()).
+        //    The ParcelFileDescriptor (`tun`) we keep is post-detach — its
+        //    own close() is a no-op for the underlying fd, so the worker is
+        //    the sole owner once it's running.
         val detachedFd = parcelFd.detachFd()
         tun2proxyRunning.set(true)
-        tun2proxyThread = Thread({
+        // Use tun2proxy_run_with_cli_args C API via dlsym — gives full
+        // CLI flexibility including --udpgw-server, no fork needed.
+        val cliArgs = buildString {
+            append("tun2proxy")
+            append(" --proxy socks5://127.0.0.1:$socks5Port")
+            append(" --tun-fd $detachedFd")
+            append(" --dns virtual")
+            append(" --verbosity info")
+            append(" --close-fd-on-drop true")
+            if (cfg.mode == Mode.FULL) append(" --udpgw-server 198.18.0.1:7300")
+        }
+        val worker = Thread({
             try {
-                val rc = Tun2proxy.run(
-                    "socks5://127.0.0.1:$socks5Port",
-                    detachedFd,
-                    /* closeFdOnDrop = */ true,
-                    MTU.toChar(),
-                    /* verbosity = info */ 3,
-                    /* dnsStrategy = virtual */ 0,
-                )
+                val rc = Native.runTun2proxy(cliArgs, MTU)
                 Log.i(TAG, "tun2proxy exited rc=$rc")
             } catch (t: Throwable) {
                 Log.e(TAG, "tun2proxy crashed: ${t.message}", t)
             } finally {
                 tun2proxyRunning.set(false)
             }
-        }, "tun2proxy").apply { start() }
+        }, "tun2proxy")
+        try {
+            worker.start()
+            tun2proxyThread = worker
+        } catch (t: Throwable) {
+            // Thread.start can throw OutOfMemoryError under extreme memory
+            // pressure. The fd we just detached has no owner — without an
+            // explicit close it leaks for the life of the process. Adopt
+            // it into a fresh ParcelFileDescriptor purely so we can call
+            // close() on it.
+            Log.e(TAG, "tun2proxy thread start failed: ${t.message}", t)
+            tun2proxyRunning.set(false)
+            try {
+                ParcelFileDescriptor.adoptFd(detachedFd).close()
+            } catch (closeErr: Throwable) {
+                Log.w(TAG, "adoptFd($detachedFd).close failed: ${closeErr.message}")
+            }
+            Native.stopProxy(proxyHandle)
+            proxyHandle = 0L
+            try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Throwable) {}
+            stopSelf()
+            return
+        }
 
         // (startForeground was already called at the top of this method
         // to satisfy Android 8+'s foreground-service contract — see the
@@ -291,12 +328,23 @@ class MhrvVpnService : VpnService() {
      * tun2proxy still forwarding packets into a half-dead Rust runtime
      * while the runtime is force-aborting its tasks — that's the scenario
      * that manifested as "Stop crashes the app" when there were in-flight
-     * relay requests piled up against a dead Apps Script deployment. The
-     * correct order is:
-     *   1. Signal tun2proxy to stop (cooperative).
-     *   2. Close the TUN fd — forces tun2proxy's read() to return EBADF.
-     *   3. Join the tun2proxy thread (now it really will exit).
-     *   4. Shut down the Rust proxy runtime (nothing left to forward to).
+     * relay requests piled up against a dead Apps Script deployment.
+     *
+     * Steps, with the bound on each one called out so a hung native call
+     * cannot stall the whole teardown thread:
+     *   1. Signal tun2proxy to stop (cooperative). Bounded by a 2s
+     *      side-thread join — if the JNI call hangs we proceed anyway.
+     *   2. Drop our `ParcelFileDescriptor` reference. Because we already
+     *      called detachFd() at startup, this is a no-op for the
+     *      underlying fd — the worker (closeFdOnDrop=true) owns it.
+     *      We keep the call only so the PROXY_ONLY / failed-establish
+     *      paths still null out the field cleanly.
+     *   3. Join the tun2proxy thread, bounded at 4s. If the worker is
+     *      stuck we log and move on — the runtime shutdown below will
+     *      knock the rest of the world over.
+     *   4. Shut down the Rust proxy runtime, bounded by `rt.shutdown_timeout`
+     *      on the Rust side (5s). This is the hard backstop: the listener
+     *      socket is released here regardless of what the worker is doing.
      */
     private fun teardown() {
         // Idempotency guard. Without this, onDestroy racing the
@@ -315,17 +363,29 @@ class MhrvVpnService : VpnService() {
             "(tun2proxy running=${tun2proxyRunning.get()}, proxyHandle=$proxyHandle)",
         )
 
-        // 1. Cooperative stop signal.
+        // 1. Cooperative stop signal — bounded so a hung Rust call cannot
+        //    stall the entire teardown thread. We've never observed
+        //    Tun2proxy.stop() block in practice, but the contract isn't
+        //    documented as bounded and the rest of teardown already takes
+        //    care to be timeout-bounded; this closes the gap.
         if (tun2proxyRunning.get()) {
-            try { Tun2proxy.stop() } catch (t: Throwable) {
-                Log.w(TAG, "Tun2proxy.stop: ${t.message}")
+            val stopper = Thread({
+                try { Tun2proxy.stop() } catch (t: Throwable) {
+                    Log.w(TAG, "Tun2proxy.stop: ${t.message}")
+                }
+            }, "mhrv-tun2proxy-stop").apply { start() }
+            try { stopper.join(2_000) } catch (_: InterruptedException) {}
+            if (stopper.isAlive) {
+                Log.w(TAG, "Tun2proxy.stop did not return within 2s — proceeding")
             }
         }
 
-        // 2. Close the TUN fd. Since we called detachFd earlier the
-        //    ParcelFileDescriptor no longer owns the fd and close() here
-        //    is a no-op; the real fd is owned by tun2proxy (closeFdOnDrop
-        //    = true), which closes it on return from run().
+        // 2. Drop our PFD reference. detachFd at startup means this
+        //    close() is a no-op for the underlying fd — tun2proxy owns
+        //    it (closeFdOnDrop = true) and closes it on return from
+        //    run(). The call is kept only to null the field cleanly on
+        //    paths that never reached detachFd (PROXY_ONLY, or an
+        //    establish() that failed mid-builder).
         try { tun?.close() } catch (t: Throwable) {
             Log.w(TAG, "tun.close: ${t.message}")
         }
@@ -378,7 +438,7 @@ class MhrvVpnService : VpnService() {
         Log.i(TAG, "onDestroy done")
     }
 
-    private fun buildNotif(proxyPort: Int): Notification {
+    private fun buildNotif(httpPort: Int, socks5Port: Int): Notification {
         val mgr = getSystemService(NotificationManager::class.java)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val ch = NotificationChannel(
@@ -405,7 +465,7 @@ class MhrvVpnService : VpnService() {
         )
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("mhrv-rs VPN is active")
-            .setContentText("Routing via SOCKS5 127.0.0.1:${proxyPort + 1}")
+            .setContentText("HTTP 127.0.0.1:$httpPort  ·  SOCKS5 127.0.0.1:$socks5Port")
             .setSmallIcon(android.R.drawable.presence_online)
             .setContentIntent(openIntent)
             .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Stop", stopIntent)

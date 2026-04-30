@@ -102,14 +102,16 @@ This part is unchanged from the original project. Follow @masterking32's guide o
    - Who has access: **Anyone**
 6. Copy the **Deployment ID** (the long random string in the URL).
 
+> **Alternative backend — Apps Script + Cloudflare Worker.** A variant in [`assets/apps_script/Code.cfw.gs`](assets/apps_script/Code.cfw.gs) + [`assets/cloudflare/worker.js`](assets/cloudflare/worker.js) turns Apps Script into a thin forwarder and offloads the actual fetch to a Cloudflare Worker you deploy. The win on day one is **latency** (~10-50 ms at the CF edge vs ~250-500 ms in Apps Script — visibly snappier for browsing and Telegram). It does **not** reduce your daily 20k Apps Script `UrlFetchApp` count, because today's mhrv-rs always sends single-URL relay requests; the batch path on the GAS+Worker side is wired and ready (`ceil(N/40)` quota per N-URL batch) but no shipping client emits it. Trade-offs: worse for YouTube long-form (30 s wall vs 6 min), no fix for Cloudflare anti-bot, **not compatible with `mode: "full"`** (no tunnel-ops support → won't help WhatsApp/messengers on Android full mode). Full setup and trade-off table in [`assets/cloudflare/README.md`](assets/cloudflare/README.md). mhrv-rs needs no config changes — same `mode: "apps_script"`, same `script_id`, same `auth_key`.
+
 #### Can't reach `script.google.com` from your network?
 
-If your ISP is already blocking Google Apps Script (or all of Google), you need Step 1's browser connection to succeed *before* you have a relay to use. `mhrv-rs` ships a small bootstrap mode for exactly this: `google_only`.
+If your ISP is already blocking Google Apps Script (or all of Google), you need Step 1's browser connection to succeed *before* you have a relay to use. `mhrv-rs` ships a `direct` mode for exactly this — SNI-rewrite tunnel only, no Apps Script relay required. (Was named `google_only` before v1.9 — the old name is still accepted in config files.)
 
 1. Build / download the binary as in Step 2 below.
-2. Copy [`config.google-only.example.json`](config.google-only.example.json) to `config.json` — no `script_id`, no `auth_key` required.
+2. Copy [`config.direct.example.json`](config.direct.example.json) to `config.json` — no `script_id`, no `auth_key` required.
 3. Run `mhrv-rs serve` and set your browser's HTTP proxy to `127.0.0.1:8085`.
-4. In `google_only` mode the proxy only relays `*.google.com`, `*.youtube.com`, and the other Google-edge hosts via the same SNI-rewrite tunnel the full client uses. Other traffic goes direct — no Apps Script relay exists yet.
+4. In `direct` mode the proxy only routes `*.google.com`, `*.youtube.com`, and the other Google-edge hosts (plus any [`fronting_groups`](docs/fronting-groups.md) you've configured) via the SNI-rewrite tunnel. Other traffic goes raw — no Apps Script relay exists yet.
 5. Do Step 1 in your browser (the connection to `script.google.com` will be SNI-fronted). Deploy Code.gs, copy the Deployment ID.
 6. In the desktop UI or the Android app (or by editing `config.json`) switch the mode back to `apps_script`, paste the Deployment ID and your auth key, and restart.
 
@@ -135,7 +137,7 @@ To route your browser's HTTPS traffic through the Apps Script relay, `mhrv-rs` h
 - A fresh CA keypair (`ca/ca.crt` + `ca/ca.key`) is generated **on your machine**, in your user-data dir.
 - The public `ca.crt` is added to your system trust store so browsers accept the per-site certificates `mhrv-rs` mints on the fly. This is the step that needs sudo / Administrator.
 - The private `ca.key` **never leaves your machine**. Nothing uploads it, nothing phones home, and no remote party — including the Apps Script relay — can use it to impersonate sites to you.
-- You can revoke it at any time by deleting the CA from your OS keychain (macOS: Keychain Access → System → delete `mhrv-rs`) / Windows cert store / `/etc/ca-certificates`, and removing the `ca/` folder.
+- You can revoke it at any time with `mhrv-rs --remove-cert` (or the **Remove CA** button in the UI) — it clears the CA from the OS trust store, verifies the revocation by name before touching disk, and deletes the on-disk `ca/` folder. NSS cleanup (Firefox profiles + Chrome/Chromium on Linux) is best-effort: if `certutil` from libnss3-tools isn't on PATH or a browser has the NSS DB locked, the tool logs a manual-cleanup hint. `config.json` and your Apps Script deployment are not touched, so regenerating the CA never requires redeploying `Code.gs`. Manual fallback: the certificate's Common Name is `MasterHttpRelayVPN` (not `mhrv-rs` — that's the app name, not the cert name). Delete by that CN in your OS keychain (macOS: Keychain Access → System → delete `MasterHttpRelayVPN`), Windows `certmgr.msc` → Trusted Root Certification Authorities, or `/usr/local/share/ca-certificates/MasterHttpRelayVPN.crt` + `sudo update-ca-certificates` on Linux; remove the `MasterHttpRelayVPN` entry from each browser's cert settings; and remove the `ca/` folder under the user-data dir.
 
 The launcher does all of this for you and then starts the UI:
 
@@ -197,8 +199,13 @@ Then:
 ./mhrv-rs test              # one-shot end-to-end probe
 ./mhrv-rs scan-ips          # rank Google frontend IPs by latency
 ./mhrv-rs --install-cert    # reinstall the MITM CA
+./mhrv-rs --remove-cert     # clean slate: uninstall + delete the whole ca/ dir
 ./mhrv-rs --help
 ```
+
+`--remove-cert` deletes the CA from the OS trust store, deletes the on-disk `ca/` directory, and verifies the revocation by name — if a system-level delete needed admin you didn't have, it aborts the file deletion and prints an error so you can re-run elevated. NSS cleanup (Firefox profiles + Chrome/Chromium on Linux) is best-effort: if `certutil` isn't on PATH or a browser holds the NSS DB open, the tool logs a manual-cleanup hint. Your `config.json` and the Apps Script deployment at `script.google.com` are untouched, so a fresh CA (generated next time you start the proxy) does not require redeploying `Code.gs`.
+
+> **Upgrading from pre-v1.2.11?** Earlier versions wrote a bare `user_pref("security.enterprise_roots.enabled", true);` into each Firefox profile's `user.js` without a provenance marker. `--remove-cert` intentionally does **not** strip that line — a bare pref is indistinguishable from one authored by the user or a corporate policy, and silently revoking trust behavior is worse than leaving one cosmetic orphan line. Firefox falls back to its built-in Mozilla root store the moment the MITM CA leaves the OS trust store, so this has no functional effect. Delete the line manually if it bothers you.
 
 `script_id` can also be a JSON array: `["id1", "id2", "id3"]`.
 
@@ -313,6 +320,26 @@ More deployments = more total concurrency = lower per-session latency. Each batc
   "auth_key": "your-secret"
 }
 ```
+
+## Sharing via hotspot (Android → iOS / laptop)
+
+The proxy listens on `0.0.0.0` by default, so any device on the same network can use it. This lets you share the tunnel from an Android phone to an iPhone, iPad, or laptop over hotspot:
+
+1. **Android**: enable mobile hotspot + start the app
+2. **Other device**: connect to the Android hotspot WiFi
+3. **Configure proxy** on the other device:
+   - **Server**: `192.168.43.1` (Android's default hotspot IP)
+   - **Port**: `8080` (HTTP) or `1081` (SOCKS5)
+
+### iOS setup
+Settings → WiFi → tap (i) on the hotspot network → Configure Proxy → Manual → Server `192.168.43.1`, Port `8080`.
+
+For full device-wide coverage on iOS, use an app like [Shadowrocket](https://apps.apple.com/app/shadowrocket/id932747118) or [Potatso](https://apps.apple.com/app/potatso/id1239860606) — point it at the SOCKS5 proxy (`192.168.43.1:1081`) and it will route all traffic through the tunnel.
+
+### macOS / Windows
+Set the system HTTP proxy to `192.168.43.1:8080` in network settings, or configure per-app SOCKS5 proxy to `192.168.43.1:1081`.
+
+> **Note**: if `listen_host` is set to `127.0.0.1` in your config, change it to `0.0.0.0` to allow connections from other devices.
 
 ## Running on OpenWRT (or any musl distro)
 
@@ -474,17 +501,21 @@ Donations cover hosting, self-hosted CI runner costs, and continued maintenance.
 
 > **نکته:** اگر نمی‌دانید رمز `AUTH_KEY` چه بگذارید، یک رشتهٔ تصادفی ۱۶ تا ۲۴ کاراکتری بسازید. مهم فقط این است که **دقیقاً همان رشته** را در برنامه هم وارد کنید.
 
+<!-- -->
+
+> **پشتیبان جایگزین — `Apps Script` + `Cloudflare Worker`.** نسخه‌ای در [`assets/apps_script/Code.cfw.gs`](assets/apps_script/Code.cfw.gs) به‌همراه [`assets/cloudflare/worker.js`](assets/cloudflare/worker.js) وجود دارد که `Apps Script` را به یک رلهٔ نازک تبدیل می‌کند و کار `fetch` واقعی را به یک `Cloudflare Worker` که خودتان مستقر می‌کنید می‌سپارد. سود روز اول این کار **کاهش تأخیر** است (~۱۰ تا ۵۰ میلی‌ثانیه روی لبهٔ `CF` به جای ۲۵۰ تا ۵۰۰ میلی‌ثانیه روی `Apps Script` — برای مرور وب و تلگرام محسوس). سهمیهٔ روزانهٔ `UrlFetchApp` (~۲۰٬۰۰۰) را کاهش **نمی‌دهد**، چون امروز `mhrv-rs` همیشه درخواست تک‌آدرسی می‌فرستد؛ مسیر دسته‌ای روی `GAS+Worker` آماده و سیم‌کشی شده (`ceil(N/40)` سهمیه به‌ازای دستهٔ `N` آدرسی) ولی هیچ کلاینتی فعلاً آن را تولید نمی‌کند. مبادلات: ویدیوی طولانی یوتیوب بدتر می‌شود (دیوار ۳۰ ثانیه به جای ۶ دقیقه)، ضدبات `Cloudflare` را حل نمی‌کند، و **با `mode: "full"` سازگار نیست** (پشتیبانی از عملیات تونل ندارد → برای واتس‌اَپ و سایر مسنجرها روی اندرویدِ تونل کامل کمکی نمی‌کند). راهنمای کامل استقرار و جدول مبادلات در [`assets/cloudflare/README.fa.md`](assets/cloudflare/README.fa.md). در `mhrv-rs` هیچ تنظیمی تغییر نمی‌کند — همان `mode: "apps_script"`، همان `script_id`، همان `auth_key`.
+
 #### به `script.google.com` هم دسترسی ندارید؟
 
-اگر `ISP` شما از قبل `Apps Script` (یا کل گوگل) را مسدود کرده، برای مرحلهٔ ۱ باید مرورگرتان **اول** به `script.google.com` برسد — قبل از اینکه رله‌ای داشته باشید. `mhrv-rs` یک حالت بوت‌استرپ کوچک دقیقاً برای همین دارد: `google_only`.
+اگر `ISP` شما از قبل `Apps Script` (یا کل گوگل) را مسدود کرده، برای مرحلهٔ ۱ باید مرورگرتان **اول** به `script.google.com` برسد — قبل از اینکه رله‌ای داشته باشید. `mhrv-rs` یک حالت `direct` دقیقاً برای همین دارد — فقط تونل بازنویسی `SNI`، بدون نیاز به رلهٔ `Apps Script`. (قبل از v1.9 این حالت `google_only` نام داشت — نام قدیمی همچنان در فایل کانفیگ پذیرفته می‌شود.)
 
 ۱. برنامه را طبق مرحلهٔ ۲ پایین دانلود کنید
 
-۲. فایل [`config.google-only.example.json`](config.google-only.example.json) را در کنار فایل اجرایی به نام `config.json` کپی کنید — نه `script_id` لازم دارد و نه `auth_key`
+۲. فایل [`config.direct.example.json`](config.direct.example.json) را در کنار فایل اجرایی به نام `config.json` کپی کنید — نه `script_id` لازم دارد و نه `auth_key`
 
 ۳. برنامه را اجرا کنید و `HTTP proxy` مرورگرتان را روی `127.0.0.1:8085` تنظیم کنید
 
-۴. در حالت `google_only`، پروکسی فقط `*.google.com`، `*.youtube.com` و بقیهٔ میزبان‌های لبهٔ گوگل را از طریق همان تونل بازنویسی `SNI` رد می‌کند. بقیهٔ ترافیک مستقیم می‌رود — هنوز رله‌ای در کار نیست
+۴. در حالت `direct`، پروکسی فقط `*.google.com`، `*.youtube.com` و بقیهٔ میزبان‌های لبهٔ گوگل (به علاوهٔ هر [`fronting_groups`](docs/fronting-groups.md) که تنظیم کرده باشید) را از طریق تونل بازنویسی `SNI` رد می‌کند. بقیهٔ ترافیک مستقیم می‌رود — هنوز رله‌ای در کار نیست
 
 ۵. حالا مرحلهٔ ۱ را در مرورگر انجام دهید (اتصال به `script.google.com` با `SNI` فرونت می‌شود). `Code.gs` را مستقر کنید و `Deployment ID` را کپی کنید
 
@@ -710,9 +741,15 @@ logread -e mhrv-rs -f
 
 **چطور گواهی را بعداً حذف کنم؟**
 
-- **مک:** `Keychain Access` را باز کنید، در بخش `System` دنبال `mhrv-rs` بگردید و حذف کنید. سپس پوشهٔ `~/Library/Application Support/mhrv-rs/ca/` را پاک کنید
-- **ویندوز:** `certmgr.msc` را اجرا کنید → `Trusted Root Certification Authorities` → `Certificates` → دنبال `mhrv-rs` بگردید و حذف کنید
-- **لینوکس:** فایل `/usr/local/share/ca-certificates/mhrv-rs.crt` را حذف و `sudo update-ca-certificates` اجرا کنید
+- **ساده‌ترین راه (هر سه سیستم‌عامل):** داخل برنامه روی دکمهٔ **`Remove CA`** بزنید، یا در ترمینال:
+  - مک/لینوکس: `sudo ./mhrv-rs --remove-cert`
+  - ویندوز (با `Run as administrator`): `mhrv-rs.exe --remove-cert`
+  - این دستور گواهی را از `trust store` سیستم و `NSS` (فایرفاکس/کروم) پاک می‌کند و فایل‌های `ca/ca.crt` و `ca/ca.key` را هم روی دیسک حذف می‌کند. فایل `config.json` و `deployment` آپس‌اسکریپت دست‌نخورده می‌مانند — پس لازم نیست `Code.gs` را دوباره دیپلوی کنید.
+- **به‌صورت دستی** (اگر می‌خواهید):
+  - **نکته:** نام گواهی (`Common Name`) در همهٔ مکان‌ها `MasterHttpRelayVPN` است — `mhrv-rs` نام برنامه است، نه نام گواهی.
+  - **مک:** `Keychain Access` را باز کنید، در بخش `System` دنبال `MasterHttpRelayVPN` بگردید و حذف کنید. سپس پوشهٔ `~/Library/Application Support/mhrv-rs/ca/` را پاک کنید
+  - **ویندوز:** `certmgr.msc` را اجرا کنید → `Trusted Root Certification Authorities` → `Certificates` → دنبال `MasterHttpRelayVPN` بگردید و حذف کنید
+  - **لینوکس:** فایل `/usr/local/share/ca-certificates/MasterHttpRelayVPN.crt` را حذف و `sudo update-ca-certificates` اجرا کنید
 
 **چند `Deployment ID` لازم دارم؟**
 یکی برای استفادهٔ عادی کافی است. سهمیهٔ روزانه `UrlFetchApp` برای حساب رایگان گوگل **۲۰٬۰۰۰ درخواست در روز** است (برای `Workspace` پولی ۱۰۰٬۰۰۰)، با محدودیت پاسخ ۵۰ مگابایت به ازای هر `fetch`. از هر حساب گوگل **فقط یک `Deployment`** بسازید — سقف ۳۰ درخواست همزمان به ازای هر حساب است، پس چند `Deployment` روی یک حساب همزمانی اضافه نمی‌کند. برای افزایش همزمانی یا سهمیهٔ روزانه، در حساب‌های گوگل دیگر `Deployment` بسازید — هر حساب سهمیهٔ ۲۰ هزار درخواستی و ۳۰ اجرای همزمان خودش را دارد. همهٔ `ID`ها را در فیلد `Apps Script ID(s)` وارد کنید — برنامه خودکار بینشان می‌چرخد. مرجع: <https://developers.google.com/apps-script/guides/services/quotas>
@@ -735,8 +772,11 @@ logread -e mhrv-rs -f
 ./mhrv-rs scan-ips          # رتبه‌بندی IPهای گوگل بر اساس سرعت
 ./mhrv-rs test-sni          # تست نام‌های SNI در pool
 ./mhrv-rs --install-cert    # نصب مجدد گواهی
+./mhrv-rs --remove-cert     # حذف کامل گواهی: پاک‌سازی trust store و کل پوشهٔ ca/
 ./mhrv-rs --help
 ```
+
+دستور `--remove-cert` گواهی را از `trust store` سیستم پاک می‌کند، با بررسی نام تأیید می‌کند که حذف انجام شده، و سپس پوشهٔ `ca/` روی دیسک را حذف می‌کند — اگر حذف نیاز به دسترسی ادمین داشته باشد که در دسترس نبوده، قبل از پاک کردن فایل‌ها متوقف می‌شود تا بتوانید با دسترسی مدیر دوباره اجرا کنید. پاک‌سازی `NSS` (فایرفاکس/کروم) `best-effort` است: اگر `certutil` نصب نباشد یا یکی از مرورگرها بازِ دیتابیس را قفل کرده باشد، ابزار پیغامی با راهنمای پاک‌سازی دستی نشان می‌دهد. فایل `config.json` شما و `deployment` آپس‌اسکریپت در `script.google.com` دست‌نخورده می‌مانند — یعنی وقتی در اجرای بعدی گواهی تازه تولید می‌شود، نیازی به دیپلوی مجدد `Code.gs` نیست.
 
 **چرا گاهی جست‌وجوی گوگل بدون `JavaScript` نشان داده می‌شود؟**
 `Apps Script` مجبور است `User-Agent` درخواست‌های خود را روی `Google-Apps-Script` بگذارد. بعضی سایت‌ها این را به عنوان ربات شناسایی می‌کنند و نسخهٔ سادهٔ بدون `JavaScript` برمی‌گردانند. دامنه‌هایی که در لیست `SNI-rewrite` قرار گرفته‌اند (مثل `google.com`، `youtube.com`) از این مشکل در امان هستند چون مستقیماً از لبهٔ گوگل می‌آیند، نه از `Apps Script`.

@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
+use rand::{thread_rng, Rng, RngCore};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -60,6 +61,11 @@ const POOL_TTL_SECS: u64 = 45;
 const POOL_MAX: usize = 80;
 const REQUEST_TIMEOUT_SECS: u64 = 25;
 const RANGE_PARALLEL_CHUNK_BYTES: u64 = 256 * 1024;
+/// Cadence for Apps Script container keepalive pings. Apps Script
+/// containers go cold after ~5min idle and cost 1-3s on the first
+/// request to wake back up — most painful on YouTube / streaming where
+/// the first chunk after a quiet pause stalls the player.
+const H1_KEEPALIVE_INTERVAL_SECS: u64 = 240;
 // Keep synthetic range stitching bounded. Without this, a buggy or hostile
 // origin can advertise `Content-Range: bytes 0-1/<huge>` and make us build a
 // massive range plan or preallocate an enormous response buffer.
@@ -102,6 +108,13 @@ pub struct DomainFronter {
     inflight: Arc<Mutex<HashMap<String, broadcast::Sender<Vec<u8>>>>>,
     coalesced: AtomicU64,
     blacklist: Arc<std::sync::Mutex<HashMap<String, Instant>>>,
+    /// Per-deployment rolling timeout counter. Maps `script_id` →
+    /// `(window_start, strike_count)`. Reset when the window expires
+    /// or when a batch succeeds. Triggers a short-cooldown blacklist
+    /// at `TIMEOUT_STRIKE_LIMIT`. Distinct from `blacklist` because
+    /// strike state is per-deployment health bookkeeping, not the
+    /// permanent ban list.
+    script_timeouts: Arc<std::sync::Mutex<HashMap<String, (Instant, u32)>>>,
     relay_calls: AtomicU64,
     relay_failures: AtomicU64,
     bytes_relayed: AtomicU64,
@@ -123,6 +136,21 @@ pub struct DomainFronter {
     today_calls: AtomicU64,
     today_bytes: AtomicU64,
     today_key: std::sync::Mutex<String>,
+    /// Suppress the random `_pad` field that v1.8.0+ adds to outbound
+    /// payloads. Mirrors `Config::disable_padding` (#391). Default false
+    /// (padding active = stronger DPI defense at +25% bandwidth cost).
+    disable_padding: bool,
+    /// Per-instance auto-blacklist tuning. Mirrors `Config::auto_blacklist_*`
+    /// (#391, #444). Cached here so the hot path in `record_timeout_strike`
+    /// doesn't have to reach back through the Config (which we don't keep
+    /// a reference to).
+    auto_blacklist_strikes: u32,
+    auto_blacklist_window: Duration,
+    auto_blacklist_cooldown: Duration,
+    /// Per-batch HTTP timeout. Mirrors `Config::request_timeout_secs`
+    /// (#430, masterking32 PR #25). Read by `tunnel_client::fire_batch`
+    /// so a single config field tunes the timeout used everywhere.
+    batch_timeout: Duration,
 }
 
 /// Aggregated stats for one remote host.
@@ -145,6 +173,12 @@ impl HostStat {
 }
 
 const BLACKLIST_COOLDOWN_SECS: u64 = 600;
+
+/// Auto-blacklist defaults are now per-instance fields on `DomainFronter`,
+/// driven by `Config::auto_blacklist_strikes` / `_window_secs` /
+/// `_cooldown_secs` (#391, #444). The constants below are gone — see the
+/// `Config` doc comments for tuning guidance and `default_auto_blacklist_*`
+/// for the historical defaults (3 strikes / 30s window / 120s cooldown).
 
 /// Request payload sent to Apps Script (single, non-batch).
 #[derive(Serialize)]
@@ -258,21 +292,44 @@ impl DomainFronter {
             inflight: Arc::new(Mutex::new(HashMap::new())),
             coalesced: AtomicU64::new(0),
             blacklist: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            script_timeouts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             relay_calls: AtomicU64::new(0),
             relay_failures: AtomicU64::new(0),
             bytes_relayed: AtomicU64::new(0),
             per_site: Arc::new(std::sync::Mutex::new(HashMap::new())),
             today_calls: AtomicU64::new(0),
             today_bytes: AtomicU64::new(0),
-            today_key: std::sync::Mutex::new(current_utc_day_key()),
+            today_key: std::sync::Mutex::new(current_pt_day_key()),
+            disable_padding: config.disable_padding,
+            auto_blacklist_strikes: config.auto_blacklist_strikes.max(1),
+            auto_blacklist_window: Duration::from_secs(
+                config.auto_blacklist_window_secs.clamp(1, 3600),
+            ),
+            auto_blacklist_cooldown: Duration::from_secs(
+                config.auto_blacklist_cooldown_secs.clamp(1, 86400),
+            ),
+            batch_timeout: Duration::from_secs(
+                config.request_timeout_secs.clamp(5, 300),
+            ),
         })
+    }
+
+    /// Per-batch HTTP round-trip timeout. Read by `tunnel_client` so the
+    /// `BATCH_TIMEOUT` constant doesn't have to be touched on every config
+    /// change. Clamped to `[5s, 300s]` at construction.
+    pub(crate) fn batch_timeout(&self) -> Duration {
+        self.batch_timeout
     }
 
     /// Record one relay call toward the daily budget. Called once per
     /// outbound Apps Script fetch. Rolls over both daily counters at
-    /// 00:00 UTC.
-    fn record_today(&self, bytes: u64) {
-        let today = current_utc_day_key();
+    /// 00:00 Pacific Time, matching Apps Script's quota reset cadence
+    /// (#230, #362). Crate-public so the Full-mode batch path in
+    /// `tunnel_client::fire_batch` can wire into the same accounting
+    /// (Apps Script sees Full-mode batches as ordinary `UrlFetchApp`
+    /// calls and counts them against the same daily quota).
+    pub(crate) fn record_today(&self, bytes: u64) {
+        let today = current_pt_day_key();
         // Fast path: same day as what we last saw. No lock.
         let mut guard = self.today_key.lock().unwrap();
         if *guard != today {
@@ -317,8 +374,8 @@ impl DomainFronter {
         // Read today_key under lock and cheaply check rollover so the
         // UI never sees stale "today_calls=1847" on a day where no
         // traffic has flowed yet (e.g. user left the app open past
-        // midnight UTC).
-        let today_now = current_utc_day_key();
+        // midnight PT).
+        let today_now = current_pt_day_key();
         let today_key = {
             let mut guard = self.today_key.lock().unwrap();
             if *guard != today_now {
@@ -341,7 +398,7 @@ impl DomainFronter {
             today_calls: self.today_calls.load(Ordering::Relaxed),
             today_bytes: self.today_bytes.load(Ordering::Relaxed),
             today_key,
-            today_reset_secs: seconds_until_utc_midnight(),
+            today_reset_secs: seconds_until_pacific_midnight(),
         }
     }
 
@@ -414,15 +471,65 @@ impl DomainFronter {
     }
 
     fn blacklist_script(&self, script_id: &str, reason: &str) {
-        let until = Instant::now() + Duration::from_secs(BLACKLIST_COOLDOWN_SECS);
+        self.blacklist_script_for(
+            script_id,
+            Duration::from_secs(BLACKLIST_COOLDOWN_SECS),
+            reason,
+        );
+    }
+
+    fn blacklist_script_for(&self, script_id: &str, cooldown: Duration, reason: &str) {
+        let until = Instant::now() + cooldown;
         let mut bl = self.blacklist.lock().unwrap();
         bl.insert(script_id.to_string(), until);
         tracing::warn!(
             "blacklisted script {} for {}s: {}",
             mask_script_id(script_id),
-            BLACKLIST_COOLDOWN_SECS,
+            cooldown.as_secs(),
             reason
         );
+    }
+
+    /// Record a batch timeout against `script_id`. After
+    /// `TIMEOUT_STRIKE_LIMIT` timeouts inside `TIMEOUT_STRIKE_WINDOW`
+    /// the deployment is blacklisted with a short cooldown so the
+    /// round-robin stops sending real traffic to a deployment that's
+    /// hung (most commonly: stale `TUNNEL_SERVER_URL` after the
+    /// tunnel-node moved hosts).
+    pub(crate) fn record_timeout_strike(&self, script_id: &str) {
+        let now = Instant::now();
+        let mut counts = self.script_timeouts.lock().unwrap();
+        let entry = counts
+            .entry(script_id.to_string())
+            .or_insert((now, 0));
+        if now.duration_since(entry.0) > self.auto_blacklist_window {
+            *entry = (now, 1);
+        } else {
+            entry.1 += 1;
+        }
+        let strikes = entry.1;
+        if strikes >= self.auto_blacklist_strikes {
+            counts.remove(script_id);
+            drop(counts);
+            self.blacklist_script_for(
+                script_id,
+                self.auto_blacklist_cooldown,
+                &format!(
+                    "{} timeouts in {}s",
+                    strikes,
+                    self.auto_blacklist_window.as_secs()
+                ),
+            );
+        }
+    }
+
+    /// Clear the timeout strike counter for `script_id`. Called after
+    /// a batch succeeds so a recovered deployment doesn't keep stale
+    /// strikes from hours ago — three strikes must occur within one
+    /// real failure burst, not accumulate across unrelated incidents.
+    pub(crate) fn record_batch_success(&self, script_id: &str) {
+        let mut counts = self.script_timeouts.lock().unwrap();
+        counts.remove(script_id);
     }
 
     /// Log a relay failure with extra guidance on cert-validation cases.
@@ -509,6 +616,45 @@ impl DomainFronter {
         }
         if warmed > 0 {
             tracing::info!("pool pre-warmed with {} connection(s)", warmed);
+        }
+    }
+
+    /// Keep the Apps Script container warm with a periodic HEAD ping.
+    ///
+    /// `acquire()` keeps the *TCP/TLS pool* warm but does nothing for the
+    /// V8 container Apps Script runs in: that goes cold ~5min after the
+    /// last UrlFetchApp call and costs 1-3s to spin back up. The symptom
+    /// is "first request after a quiet period stalls" — most visible on
+    /// YouTube where the player gives up on a 1.5s `googlevideo.com`
+    /// chunk that's actually waiting on a cold-start.
+    ///
+    /// Bypasses the response cache (`cache_key_opt = None`) and the
+    /// inflight coalescer — otherwise the second iteration would just
+    /// hit the cached response from the first and never reach Apps
+    /// Script. The relay payload itself is the cheapest non-error one
+    /// we can build: a HEAD against `http://example.com/` returns a few
+    /// hundred bytes, no body decode, no auth.
+    ///
+    /// Best-effort. Failures are debug-logged so a flaky network or
+    /// quota-exhausted account doesn't spam warnings every 4 minutes.
+    /// Loops forever — caller is expected to drop the JoinHandle on
+    /// shutdown (the task lives as long as the process).
+    pub async fn run_h1_keepalive(self: Arc<Self>) {
+        loop {
+            tokio::time::sleep(Duration::from_secs(H1_KEEPALIVE_INTERVAL_SECS)).await;
+            let t0 = Instant::now();
+            // relay_uncoalesced returns Vec<u8> (always — errors are
+            // baked into 5xx responses), so just observe the duration
+            // for the debug line. We intentionally don't use relay()
+            // here because that path goes through the cache + coalesce
+            // layer, which would short-circuit subsequent pings.
+            let _ = self
+                .relay_uncoalesced("HEAD", "http://example.com/", &[], &[], None)
+                .await;
+            tracing::debug!(
+                "H1 container keepalive: {}ms",
+                t0.elapsed().as_millis()
+            );
         }
     }
 
@@ -642,9 +788,9 @@ impl DomainFronter {
     ///      by relay() already (we skip cache for it).
     ///   2. Probe with `Range: bytes=0-<chunk-1>`.
     ///   3. 200 back (origin doesn't support ranges) → return as-is.
-    ///   4. 206 back → parse Content-Range total. If the body fits in
-    ///      the first probe (total <= chunk or body >= total), rewrite
-    ///      the 206 to a 200 so the client — which never asked for a
+    ///   4. 206 back → parse Content-Range total. If Content-Range says
+    ///      the entity fits in the first probe, rewrite the 206 to a 200
+    ///      so the client — which never asked for a
     ///      range — doesn't choke on a stray Partial Content. (x.com
     ///      and Cloudflare turnstile in particular reject unsolicited
     ///      206 on XHR/fetch.)
@@ -765,24 +911,39 @@ impl DomainFronter {
             match chunk {
                 Ok(chunk) => full.extend_from_slice(&chunk),
                 Err(reason) => {
+                    // Issue #162: silently rewriting the probe to a 200
+                    // here truncates the response to whatever the probe
+                    // saw (typically 256 KiB — the chunk size). Browsers
+                    // see HTTP 200 + Content-Length=262144 and treat
+                    // the download as complete; users reported "every
+                    // file capped at 256 KB" because every download
+                    // that hit this failure path landed there. Common
+                    // triggers: Apps Script stripping Content-Range,
+                    // origin returning 200-instead-of-206 on later
+                    // chunks, total mismatch across chunks. Correct
+                    // recovery is a fresh single GET — Apps Script
+                    // fetches the full URL up to its 50 MiB cap. Slow
+                    // for big files vs. the parallel path but produces
+                    // a complete response, which is what matters.
                     tracing::warn!(
-                        "range-parallel: invalid chunk {}-{} for {} ({}); falling back to probe response",
-                        start,
-                        end,
-                        url,
-                        reason,
+                        "range-parallel: invalid chunk {}-{} for {} ({}); falling back to single GET",
+                        start, end, url, reason,
                     );
-                    return rewrite_206_to_200(&first);
+                    return self.relay(method, url, headers, body).await;
                 }
             }
         }
 
         if (full.len() as u64) != total {
+            // Same fallback rationale as the chunk-validation case
+            // above: returning the probe truncates to 256 KiB. Single
+            // GET is the only way to give the user a complete file
+            // when the parallel stitch can't be trusted.
             tracing::warn!(
-                "range-parallel: stitched {}/{} bytes for {}; falling back to probe response",
+                "range-parallel: stitched {}/{} bytes for {}; falling back to single GET",
                 full.len(), total, url,
             );
-            return rewrite_206_to_200(&first);
+            return self.relay(method, url, headers, body).await;
         }
 
         // Build a 200 OK with Content-Length = full body length. Drop
@@ -1060,7 +1221,18 @@ impl DomainFronter {
             ct,
             r: true,
         };
-        Ok(serde_json::to_vec(&req)?)
+        // Serialize via Value so we can splice in the random `_pad` field
+        // without changing RelayRequest's wire schema. Apps Script ignores
+        // unknown JSON fields, so old Code.gs deployments stay compatible
+        // — the pad is just bytes-on-the-wire that the server sees and
+        // discards.
+        let mut v = serde_json::to_value(&req)?;
+        if let Value::Object(map) = &mut v {
+            if !self.disable_padding {
+                add_random_pad(map);
+            }
+        }
+        Ok(serde_json::to_vec(&v)?)
     }
 
     // ────── Full-mode tunnel protocol ──────────────────────────────────
@@ -1188,6 +1360,9 @@ impl DomainFronter {
         if let Some(d) = data {
             map.insert("d".into(), Value::String(d));
         }
+        if !self.disable_padding {
+            add_random_pad(&mut map);
+        }
         Ok(serde_json::to_vec(&Value::Object(map))?)
     }
 
@@ -1215,6 +1390,9 @@ impl DomainFronter {
         map.insert("k".into(), Value::String(self.auth_key.clone()));
         map.insert("t".into(), Value::String("batch".into()));
         map.insert("ops".into(), serde_json::to_value(ops)?);
+        if !self.disable_padding {
+            add_random_pad(&mut map);
+        }
         let payload = serde_json::to_vec(&Value::Object(map))?;
 
         let path = format!("/macros/s/{}/exec", script_id);
@@ -1393,10 +1571,26 @@ fn validate_probe_range(
         return None;
     }
     let range = parse_content_range(headers)?;
-    if range.start != 0 || range.end > requested_end || !content_range_matches_body(range, body.len()) {
+    if range.start != 0 || range.end > requested_end {
         return None;
     }
-    Some(range)
+    if content_range_matches_body(range, body.len())
+        || probe_range_covers_complete_entity(range, requested_end)
+    {
+        return Some(range);
+    }
+    None
+}
+
+fn probe_range_covers_complete_entity(range: ContentRange, requested_end: u64) -> bool {
+    // Apps Script may decode a gzip body while preserving the origin's
+    // compressed Content-Range. For the synthetic first probe only, a
+    // 0..total-1 range within the requested chunk is enough to prove we
+    // already have the complete entity; later chunks still require exact
+    // Content-Range/body length validation in extract_exact_range_body().
+    range.start == 0
+        && range.end.saturating_add(1) >= range.total
+        && range.total <= requested_end.saturating_add(1)
 }
 
 fn checked_stitched_range_capacity(total: u64) -> Option<usize> {
@@ -1509,35 +1703,138 @@ fn normalize_x_graphql_url(url: &str) -> String {
     format!("{}{}{}?{}", scheme, host, path, new_query)
 }
 
-/// "YYYY-MM-DD" of the current UTC date. Used as the daily-reset
-/// boundary for `today_calls` / `today_bytes`. We format manually so
-/// this stays std-only and doesn't pull `time` or `chrono` for a
-/// ~20-line helper.
-fn current_utc_day_key() -> String {
+/// Maximum bytes of random padding appended to outbound Apps Script
+/// JSON request bodies. Picked so the per-request padding distribution
+/// (uniformly 0..MAX) shifts the body length enough to defeat naive
+/// length-fingerprint DPI without bloating bandwidth — at the average
+/// 512-byte add, on a typical 2 KB tunnel batch this is +25%, which is
+/// negligible compared to Apps Script's per-call latency floor anyway.
+/// (Issue #313, #365 Section 1 — DPI evasion.)
+const MAX_RANDOM_PAD_BYTES: usize = 1024;
+
+/// Insert a `_pad` field of random length (0..MAX_RANDOM_PAD_BYTES)
+/// into a request payload before serialization. Server-side ignores
+/// unknown JSON fields, so this is fully backward-compatible with old
+/// `Code.gs` / `CodeFull.gs` deployments — the pad is just along for
+/// the ride.
+///
+/// Random bytes are base64-encoded (NO inner JSON-escape worries) and
+/// the pad LENGTH itself is uniformly distributed, so packet sizes
+/// land all over the place rather than clustering at a few discrete
+/// peaks. That's the property DPI's length-distribution clustering
+/// fingerprints can't match.
+fn add_random_pad(map: &mut serde_json::Map<String, Value>) {
+    let mut rng = thread_rng();
+    let len = rng.gen_range(0..=MAX_RANDOM_PAD_BYTES);
+    if len == 0 {
+        // Skip the field entirely sometimes — adds another bit of
+        // distribution variance (presence-vs-absence of `_pad` itself).
+        return;
+    }
+    let mut buf = vec![0u8; len];
+    rng.fill_bytes(&mut buf);
+    map.insert("_pad".into(), Value::String(B64.encode(&buf)));
+}
+
+/// "YYYY-MM-DD" of the current Pacific Time date. Used as the daily-reset
+/// boundary for `today_calls` / `today_bytes` because **Apps Script's
+/// quota counter resets at midnight Pacific Time, not UTC** — that's
+/// where Google's quota bookkeeping lives. We format manually so this
+/// stays std-only and doesn't pull `time-tz` or `chrono` plus a ~3 MB
+/// IANA tzdb just for one ~50-line helper. (Issue #230, #362.)
+///
+/// PT offset depends on DST: PST = UTC-8, PDT = UTC-7. We use the
+/// stable US DST rule (2nd Sunday of March 02:00 → 1st Sunday of
+/// November 02:00 = PDT, otherwise PST). The hour-of-day boundary on
+/// transition days is approximated; this drifts by up to 1h for at
+/// most 2h/year on the spring-forward / fall-back transitions, which
+/// is fine for a daily countdown.
+fn current_pt_day_key() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let (y, m, d) = unix_to_ymd_utc(secs);
+    let pt_secs = unix_to_pt_seconds(secs);
+    let (y, m, d) = unix_to_ymd_utc(pt_secs);
     format!("{:04}-{:02}-{:02}", y, m, d)
 }
 
-/// Seconds until the next 00:00 UTC. Used by the UI to render a
-/// "resets in Xh Ym" countdown without the UI having to import time
-/// libraries. Conservative: if the system clock is broken we return
-/// 0 instead of a huge negative-looking number.
-fn seconds_until_utc_midnight() -> u64 {
+/// Seconds until the next 00:00 Pacific Time. Used by the UI to render
+/// a "resets in Xh Ym" countdown matching Apps Script's actual quota
+/// reset cadence (#230, #362). Conservative: if the system clock is
+/// broken we return 0 instead of a huge negative-looking number.
+fn seconds_until_pacific_midnight() -> u64 {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
+    let pt_secs = unix_to_pt_seconds(secs);
     let day = 86_400u64;
-    let rem = secs % day;
+    let rem = pt_secs % day;
     if rem == 0 {
         day
     } else {
         day - rem
     }
+}
+
+/// Convert Unix UTC seconds to "Pacific Time as if it were UTC" seconds,
+/// i.e. add the PT-from-UTC offset (negative for the western hemisphere
+/// becomes a subtraction). Result is suitable for feeding into
+/// `unix_to_ymd_utc` to extract the PT calendar date, or for `% 86_400`
+/// to find PT seconds-into-day.
+fn unix_to_pt_seconds(utc_secs: u64) -> u64 {
+    // First-pass guess at PT date using PST (-8) — used to determine
+    // whether DST is currently in effect, which then settles the actual
+    // offset. The two-pass approach avoids the chicken-and-egg of
+    // "I need the PT date to know if it's DST, but I need the offset
+    // to compute the PT date." A 1-hour fudge in the guess is harmless
+    // because DST never starts within the first hour after midnight
+    // PST or ends within the first hour after midnight PDT.
+    let pst_guess = utc_secs.saturating_sub(8 * 3600);
+    let (y, m, d) = unix_to_ymd_utc(pst_guess);
+    let offset_secs = if pacific_is_dst(y, m, d) {
+        7 * 3600
+    } else {
+        8 * 3600
+    };
+    utc_secs.saturating_sub(offset_secs)
+}
+
+/// Whether Pacific Time is observing daylight saving on the given
+/// calendar date (year, month=1..12, day=1..31). US DST window:
+/// 2nd Sunday of March through 1st Sunday of November. The transition
+/// hour itself (02:00 local) is approximated to whole-day boundaries —
+/// good enough for a daily-quota countdown.
+fn pacific_is_dst(year: i64, month: u32, day: u32) -> bool {
+    if month < 3 || month > 11 {
+        return false;
+    }
+    if month > 3 && month < 11 {
+        return true;
+    }
+    if month == 3 {
+        let dst_start = nth_sunday_of_month(year, 3, 2);
+        day >= dst_start
+    } else {
+        // month == 11
+        let dst_end = nth_sunday_of_month(year, 11, 1);
+        day < dst_end
+    }
+}
+
+/// Day-of-month for the Nth Sunday (1-indexed) of (year, month). Uses
+/// Sakamoto's method for the month's-1st day-of-week, then offsets to
+/// the desired Sunday. Pure arithmetic, no calendar tables.
+fn nth_sunday_of_month(year: i64, month: u32, nth: u32) -> u32 {
+    // Sakamoto's day-of-week. 0 = Sunday.
+    static T: [i64; 12] = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
+    let y = if month < 3 { year - 1 } else { year };
+    let m = month as i64;
+    let dow_of_1st =
+        ((y + y / 4 - y / 100 + y / 400 + T[(m - 1) as usize] + 1).rem_euclid(7)) as u32;
+    let first_sunday = if dow_of_1st == 0 { 1 } else { 8 - dow_of_1st };
+    first_sunday + (nth - 1) * 7
 }
 
 /// Convert a Unix timestamp (seconds since 1970-01-01 UTC) to a
@@ -2012,15 +2309,18 @@ pub struct StatsSnapshot {
     pub cache_bytes: usize,
     pub blacklisted_scripts: usize,
     pub total_scripts: usize,
-    /// Relay calls attributed to the current UTC day. Resets at 00:00 UTC.
-    /// This is what-this-process-has-done today, not the Google-side bucket.
+    /// Relay calls attributed to the current Pacific Time day. Resets
+    /// at 00:00 PT (midnight Pacific) — matches Apps Script's actual
+    /// quota reset cadence (#230, #362). This is what-this-process-
+    /// has-done today, not the Google-side bucket.
     pub today_calls: u64,
-    /// Response bytes from relay calls attributed to the current UTC day.
+    /// Response bytes from relay calls attributed to the current PT day.
     pub today_bytes: u64,
-    /// "YYYY-MM-DD" of the day `today_calls` / `today_bytes` refer to.
-    /// Useful for cross-referencing against Google's dashboard.
+    /// "YYYY-MM-DD" of the PT day `today_calls` / `today_bytes` refer
+    /// to. Useful for cross-referencing against Google's dashboard,
+    /// which is also PT-aligned.
     pub today_key: String,
-    /// Seconds until the next 00:00 UTC rollover. Convenient for the UI
+    /// Seconds until the next 00:00 PT rollover. Convenient for the UI
     /// to render "Resets in Xh Ym" without importing time libraries.
     pub today_reset_secs: u64,
 }
@@ -2092,6 +2392,11 @@ fn looks_like_quota_error(msg: &str) -> bool {
         || lower.contains("rate limit")
         || lower.contains("too many times")
         || lower.contains("service invoked")
+        || lower.contains("bandwidth")
+        || lower.contains("bandbreitenkontingent")
+        || lower.contains("datenübertragungsrate")
+        || lower.contains("transfer rate")
+        || lower.contains("limit exceeded")
 }
 
 fn mask_script_id(id: &str) -> String {
@@ -2227,10 +2532,45 @@ mod tests {
     }
 
     #[test]
-    fn seconds_until_utc_midnight_is_bounded() {
-        let n = seconds_until_utc_midnight();
+    fn seconds_until_pacific_midnight_is_bounded() {
+        let n = seconds_until_pacific_midnight();
         // Must be in (0, 86400] for any valid system clock.
         assert!(n > 0 && n <= 86_400);
+    }
+
+    #[test]
+    fn nth_sunday_of_month_anchors() {
+        // Spot-check Sakamoto's day-of-week + offset arithmetic against
+        // a few known Sundays. Mistakes here would silently shift the
+        // DST transition by ±1 week.
+        // March 2026: 2nd Sunday is March 8 (Sun Mar 1, Sun Mar 8).
+        assert_eq!(nth_sunday_of_month(2026, 3, 2), 8);
+        // November 2026: 1st Sunday is November 1 (Sun Nov 1).
+        assert_eq!(nth_sunday_of_month(2026, 11, 1), 1);
+        // March 2024: 2nd Sunday is March 10 (Sun Mar 3, Sun Mar 10).
+        assert_eq!(nth_sunday_of_month(2024, 3, 2), 10);
+        // November 2024: 1st Sunday is November 3.
+        assert_eq!(nth_sunday_of_month(2024, 11, 1), 3);
+        // March 2027: 2nd Sunday is March 14.
+        assert_eq!(nth_sunday_of_month(2027, 3, 2), 14);
+    }
+
+    #[test]
+    fn pacific_dst_window_anchors() {
+        // Outside the DST window: PST.
+        assert!(!pacific_is_dst(2026, 1, 15));
+        assert!(!pacific_is_dst(2026, 12, 25));
+        assert!(!pacific_is_dst(2026, 2, 28));
+        assert!(!pacific_is_dst(2026, 11, 5)); // first Sun of Nov 2026 = Nov 1; Nov 5 is past
+        // Inside: PDT.
+        assert!(pacific_is_dst(2026, 6, 1));
+        assert!(pacific_is_dst(2026, 9, 30));
+        // Boundary: March 8, 2026 (DST start day) and after = PDT.
+        assert!(!pacific_is_dst(2026, 3, 7));
+        assert!(pacific_is_dst(2026, 3, 8));
+        // Boundary: Oct 31 = PDT, Nov 1 = first Sunday = PST flips on.
+        assert!(pacific_is_dst(2026, 10, 31));
+        assert!(!pacific_is_dst(2026, 11, 1));
     }
 
     #[test]
@@ -2429,6 +2769,59 @@ mod tests {
     }
 
     #[test]
+    fn validate_probe_range_accepts_decoded_full_entity_body_mismatch() {
+        let mut raw = b"HTTP/1.1 206 Partial Content\r\n\
+Content-Range: bytes 0-11247/11248\r\n\
+Content-Type: text/javascript\r\n\
+Vary: Accept-Encoding\r\n\
+Content-Length: 45812\r\n\r\n"
+            .to_vec();
+        raw.extend(std::iter::repeat(b'x').take(45_812));
+
+        let (status, headers, body) = split_response(&raw).unwrap();
+        assert_eq!(
+            validate_probe_range(status, &headers, body, RANGE_PARALLEL_CHUNK_BYTES - 1),
+            Some(ContentRange {
+                start: 0,
+                end: 11_247,
+                total: 11_248,
+            }),
+        );
+
+        let rewritten = rewrite_206_to_200(&raw);
+        let (status, headers, body) = split_response(&rewritten).unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(body.len(), 45_812);
+        assert!(!headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("content-range")));
+        assert_eq!(
+            headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                .map(|(_, v)| v.as_str()),
+            Some("45812"),
+        );
+    }
+
+    #[test]
+    fn validate_probe_range_rejects_missing_content_range() {
+        assert!(validate_probe_range(206, &[], b"hello", 4).is_none());
+    }
+
+    #[test]
+    fn validate_probe_range_rejects_nonzero_start() {
+        let headers = vec![("Content-Range".to_string(), "bytes 1-4/20".to_string())];
+        assert!(validate_probe_range(206, &headers, b"hell", 4).is_none());
+    }
+
+    #[test]
+    fn validate_probe_range_rejects_end_past_requested_end() {
+        let headers = vec![("Content-Range".to_string(), "bytes 0-5/20".to_string())];
+        assert!(validate_probe_range(206, &headers, b"hello!", 4).is_none());
+    }
+
+    #[test]
     fn validate_probe_range_rejects_body_length_mismatch() {
         let headers = vec![("Content-Range".to_string(), "bytes 0-4/20".to_string())];
         assert!(validate_probe_range(206, &headers, b"hey", 4).is_none());
@@ -2442,6 +2835,16 @@ mod tests {
         );
         assert_eq!(checked_stitched_range_capacity(MAX_STITCHED_RANGE_BYTES + 1), None);
         assert_eq!(checked_stitched_range_capacity(u64::MAX), None);
+    }
+
+    #[test]
+    fn extract_exact_range_body_rejects_body_length_mismatch() {
+        let raw = b"HTTP/1.1 206 Partial Content\r\n\
+Content-Range: bytes 5-9/20\r\n\
+Content-Length: 3\r\n\r\n\
+hey";
+        let err = extract_exact_range_body(raw, 5, 9, 20).unwrap_err();
+        assert_eq!(err, "Content-Range/body length mismatch");
     }
 
     #[test]
@@ -2476,6 +2879,9 @@ hello";
         assert!(!should_blacklist(200, ""));
         assert!(!should_blacklist(502, "bad gateway"));
         assert!(looks_like_quota_error("Exception: Service invoked too many times per day"));
+        assert!(looks_like_quota_error(
+            "Exception: Bandbreitenkontingent überschritten: https://example.com. Verringern Sie die Datenübertragungsrate."
+        ));
         assert!(!looks_like_quota_error("bad url"));
     }
 
