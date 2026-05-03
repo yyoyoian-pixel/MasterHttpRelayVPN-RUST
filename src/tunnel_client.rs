@@ -68,7 +68,7 @@ const CLIENT_FIRST_DATA_WAIT: Duration = Duration::from_millis(50);
 /// timer, so a rapid-fire upload burst naturally coalesces into fewer,
 /// larger batches without any explicit upload/download distinction.
 const DEFAULT_COALESCE_STEP_MS: u64 = 10;
-const DEFAULT_COALESCE_MAX_MS: u64 = 500;
+const DEFAULT_COALESCE_MAX_MS: u64 = 200;
 
 /// Structured error code the tunnel-node returns when it doesn't know the
 /// op (version mismatch). Must match `tunnel-node/src/main.rs`.
