@@ -107,7 +107,7 @@ pub struct Config {
     /// 0 = use compiled default (10ms).
     #[serde(default)]
     pub coalesce_step_ms: u16,
-    /// Hard cap on total coalesce wait (ms). 0 = use compiled default (500ms).
+    /// Hard cap on total coalesce wait (ms). 0 = use compiled default (1000ms).
     #[serde(default)]
     pub coalesce_max_ms: u16,
     /// Optional explicit SNI rotation pool for outbound TLS to `google_ip`.
