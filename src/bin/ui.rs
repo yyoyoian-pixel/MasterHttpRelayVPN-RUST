@@ -414,7 +414,7 @@ fn load_form() -> (FormState, Option<String>) {
             normalize_x_graphql: false,
             youtube_via_relay: false,
             passthrough_hosts: Vec::new(),
-            block_quic: false,
+            block_quic: true,
             disable_padding: false,
             tunnel_doh: true,
             bypass_doh_hosts: Vec::new(),
@@ -1215,6 +1215,15 @@ impl eframe::App for App {
                              prompts. Enable this to route youtube.com / youtu.be / ytimg.com through the Apps \
                              Script relay instead — slower for video, but the visible SNI matches the site.",
                         );
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add_space(120.0 + 8.0);
+                        ui.checkbox(&mut self.form.block_quic, "Block QUIC (UDP/443)")
+                            .on_hover_text(
+                                "Drop QUIC (UDP port 443) so browsers fall back to TCP/HTTPS. \
+                                 QUIC over the TCP-based tunnel causes TCP-over-TCP meltdown \
+                                 (<1 Mbps). Browsers detect the drop and switch to TCP within seconds.",
+                            );
                     });
                 });
             });

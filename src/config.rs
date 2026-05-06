@@ -202,7 +202,7 @@ pub struct Config {
     /// flag lets users who care about consistency over peak speed
     /// opt out of QUIC at the source rather than discovering its
     /// failure modes later. Issue #213.
-    #[serde(default)]
+    #[serde(default = "default_block_quic")]
     pub block_quic: bool,
     /// When true, suppress the random `_pad` field that v1.8.0+ adds
     /// to outbound Apps Script requests for DPI evasion. Default off
@@ -472,6 +472,11 @@ fn default_google_ip_validation() -> bool {true}
 /// dominant userbase. Users on networks where direct DoH works can
 /// opt back in with `tunnel_doh: false`.
 fn default_tunnel_doh() -> bool { true }
+
+/// Default for `block_quic`: `true`. QUIC over the TCP-based tunnel
+/// causes TCP-over-TCP meltdown (<1 Mbps). Browsers fall back to
+/// HTTPS/TCP within seconds of the silent UDP drop.
+fn default_block_quic() -> bool { true }
 
 /// Defaults for the auto-blacklist tuning knobs (#391, #444). These
 /// preserve historical behavior — `3 strikes / 30s window / 120s cooldown`.
