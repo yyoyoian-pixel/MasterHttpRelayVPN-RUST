@@ -83,16 +83,47 @@ object Native {
      * Live traffic/usage counters for a running proxy handle. Returns a
      * JSON blob with the StatsSnapshot fields — or an empty string if the
      * handle is unknown or the proxy isn't using the Apps Script relay
-     * (google_only / full-only modes).
+     * (direct / full-only modes).
      *
      * Schema (all integer fields unless noted):
      *   relay_calls, relay_failures, coalesced, bytes_relayed,
      *   cache_hits, cache_misses, cache_bytes,
      *   blacklisted_scripts, total_scripts,
-     *   today_calls, today_bytes, today_key (string "YYYY-MM-DD"),
-     *   today_reset_secs (seconds until 00:00 UTC rollover)
+     *   today_calls, today_bytes, today_key (string "YYYY-MM-DD" in
+     *     Pacific Time — matches Apps Script's actual quota reset),
+     *   today_reset_secs (seconds until the next 00:00 Pacific Time
+     *     rollover; ~7-8 h offset from UTC depending on DST),
+     *   h2_calls (calls served by the HTTP/2 multiplexed transport,
+     *     across all entry points — Apps-Script direct, exit-node
+     *     outer call, full-mode tunnel single op, full-mode tunnel
+     *     batch. NOT comparable to relay_calls, which only sees the
+     *     Apps-Script-direct path),
+     *   h2_fallbacks (calls that attempted h2 but had to fall back
+     *     to h1 — handshake failure, open backoff, sticky ALPN
+     *     refusal, post-send error retried on h1; same all-entry-
+     *     points scope as h2_calls. Compute h2 health as
+     *     h2_calls / (h2_calls + h2_fallbacks)),
+     *   h2_disabled (boolean: true when h2 fast path is permanently
+     *     off — config force_http1 set, or peer refused h2 via ALPN)
      *
      * Cheap — just reads atomics. Safe to poll on a second-scale timer.
      */
     external fun statsJson(handle: Long): String
+
+    /**
+     * Pipeline debug overlay snapshot. Returns a JSON blob with elevated
+     * session count, batch semaphore usage, and recent ramp/drop events.
+     * Temporary — for debugging pipeline behavior on-device.
+     */
+    external fun pipelineDebugJson(): String
+
+    /**
+     * Start tun2proxy via its CLI args C API (`tun2proxy_run_with_cli_args`).
+     * Resolved at runtime via dlsym from libtun2proxy.so — no fork needed.
+     *
+     * @param cliArgs full CLI string, e.g. "tun2proxy --proxy socks5://... --tun-fd 42 --udpgw-server 192.0.2.1:7300"
+     * @param tunMtu TUN MTU (typically 1500)
+     * @return 0 on normal shutdown, negative on error. BLOCKS.
+     */
+    external fun runTun2proxy(cliArgs: String, tunMtu: Int): Int
 }

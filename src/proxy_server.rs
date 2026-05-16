@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, Mutex};
@@ -15,7 +16,7 @@ use tokio_rustls::rustls::server::Acceptor;
 use tokio_rustls::rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
 use tokio_rustls::{LazyConfigAcceptor, TlsAcceptor, TlsConnector};
 
-use crate::config::{Config, Mode};
+use crate::config::{Config, FrontingGroup, Mode};
 use crate::domain_fronter::DomainFronter;
 use crate::mitm::MitmCertManager;
 use crate::tunnel_client::{decode_udp_packets, TunnelMux};
@@ -47,6 +48,18 @@ const SNI_REWRITE_SUFFIXES: &[&str] = &[
     "youtu.be",
     "youtube-nocookie.com",
     "ytimg.com",
+    // NOTE on `googlevideo.com`: v1.7.4 (#275) added this here on the
+    // theory that video chunks should bypass the Apps Script relay.
+    // **Reverted in v1.7.6** — multiple users (#275 amirabbas117, #281
+    // mrerf) reported total YouTube breakage after v1.7.4. Root cause
+    // is that googlevideo.com is served by Google's separate "EVA"
+    // edge IPs, not the regular GFE IPs that the user's `google_ip`
+    // typically points at. SNI-rewriting `googlevideo.com:443` to a
+    // GFE IP got TLS handshake / wrong-cert errors for those users.
+    // Pre-v1.7.4 behaviour (chunks via the Apps Script relay path —
+    // slow but reliable on every GFE IP) is restored. If we ever want
+    // direct googlevideo.com routing, it needs a separate config knob
+    // that lets users specify their EVA edge IP independently.
     // Google Video Transport CDN — YouTube video chunks, Chrome
     // auto-updates, Google Play Store downloads. The single biggest
     // gap vs the upstream Python port: without these in the list
@@ -72,27 +85,100 @@ const SNI_REWRITE_SUFFIXES: &[&str] = &[
     "blogger.com",
 ];
 
-/// YouTube-family suffixes. Extracted so `youtube_via_relay` config can
-/// pull them out of the SNI-rewrite dispatch at runtime.
-const YOUTUBE_SNI_SUFFIXES: &[&str] = &[
+/// YouTube hosts that should be routed through the Apps Script relay
+/// when `youtube_via_relay` is enabled — the API + HTML surfaces where
+/// Restricted Mode is actually enforced (via the SNI=www.google.com
+/// edge looking at the request). Issue #102 / #275.
+///
+/// Deliberately narrower than the YouTube section of
+/// `SNI_REWRITE_SUFFIXES`:
+///   - `youtube.com` / `youtu.be` / `youtube-nocookie.com`: HTML pages
+///     and player frames. These trigger Restricted Mode if served via
+///     the SNI rewrite, so when the flag is on we relay them.
+///   - `youtubei.googleapis.com`: the YouTube data API the player
+///     queries for video metadata + manifest. Restricted Mode also
+///     gates video availability here. Without this entry, the JSON
+///     RPC layer would still hit the SNI-rewrite tunnel via the
+///     broader `googleapis.com` suffix — the user-visible symptom of
+///     that miss is "youtube_via_relay flips on but Restricted Mode
+///     stays sticky on some videos."
+///
+/// **NOT** in this list (intentional, was a regression in #275):
+///   - `ytimg.com`: thumbnails. No Restricted Mode logic on a static
+///     image CDN; routing through Apps Script makes thumbnails slow
+///     for zero gain.
+///   - `googlevideo.com`: video chunk CDN. Routing through Apps Script
+///     means every chunk eats Apps Script quota *and* risks the 6-min
+///     execution cap aborting long videos mid-playback.
+///   - `ggpht.com`: channel/profile images, same reasoning as ytimg.
+const YOUTUBE_RELAY_HOSTS: &[&str] = &[
     "youtube.com",
     "youtu.be",
     "youtube-nocookie.com",
-    "ytimg.com",
+    "youtubei.googleapis.com",
+];
+
+/// Built-in list of DNS-over-HTTPS endpoints. CONNECTs to these (when
+/// `tunnel_doh` is left at the default of `false`, i.e. bypass enabled)
+/// skip the Apps Script tunnel and exit via plain TCP. Mix of the
+/// browser-pinned variants Chrome/Brave/Edge/Firefox/Safari use and the
+/// well-known public DoH providers users wire up by hand. Suffix
+/// matching means we don't need to enumerate every tenant subdomain
+/// (e.g. `*.cloudflare-dns.com` covers Workers-hosted DoH too).
+///
+/// Entries are matched case-insensitively. Both exact-match (`dns.google`)
+/// and dot-anchored suffix-match (a host whose suffix is `.cloudflare-dns.com`
+/// or which equals `cloudflare-dns.com`) are accepted — same shape as
+/// `passthrough_hosts`'s `.foo` rule.
+const DEFAULT_DOH_HOSTS: &[&str] = &[
+    // The base SLD covers every tenant subdomain via suffix matching;
+    // the browser-pinned variants below are listed for grep/discovery
+    // (so a user searching "chrome.cloudflare-dns.com" finds this list)
+    // and are technically redundant under cloudflare-dns.com.
+    "cloudflare-dns.com",
+    "chrome.cloudflare-dns.com",
+    "mozilla.cloudflare-dns.com",
+    "1dot1dot1dot1.cloudflare-dns.com",
+    "dns.google",
+    "dns.google.com",
+    "dns.quad9.net",
+    "dns11.quad9.net",
+    "dns.adguard-dns.com",
+    "unfiltered.adguard-dns.com",
+    "family.adguard-dns.com",
+    "dns.nextdns.io",
+    "doh.opendns.com",
+    "doh.cleanbrowsing.org",
+    "doh.dns.sb",
+    "dns0.eu",
+    "dns.alidns.com",
+    "doh.pub",
+    "dns.mullvad.net",
 ];
 
 fn matches_sni_rewrite(host: &str, youtube_via_relay: bool) -> bool {
     let h = host.to_ascii_lowercase();
     let h = h.trim_end_matches('.');
+
+    // YouTube relay carve-out runs FIRST so it wins over the broad
+    // `googleapis.com` suffix that would otherwise pull
+    // `youtubei.googleapis.com` into the SNI-rewrite path. The earlier
+    // implementation iterated SNI_REWRITE_SUFFIXES with a filter, which
+    // works for sibling entries (e.g. `youtube.com` in both lists) but
+    // not for nested ones (`youtubei.googleapis.com` matches the broad
+    // `googleapis.com` even when its specific entry is filtered out).
+    // The short-circuit here is unconditional — we don't need to check
+    // SNI rewrite once we've decided this host goes to the relay.
+    if youtube_via_relay {
+        for s in YOUTUBE_RELAY_HOSTS {
+            if h == *s || h.ends_with(&format!(".{}", s)) {
+                return false;
+            }
+        }
+    }
+
     SNI_REWRITE_SUFFIXES
         .iter()
-        .filter(|s| {
-            // If the user opted into youtube_via_relay, skip YouTube
-            // suffixes so they fall through to the Apps Script relay
-            // path. See config.rs `youtube_via_relay` docs for the
-            // trade-off. Issue #102.
-            !(youtube_via_relay && YOUTUBE_SNI_SUFFIXES.contains(s))
-        })
         .any(|s| h == *s || h.ends_with(&format!(".{}", s)))
 }
 
@@ -125,12 +211,15 @@ pub struct ProxyServer {
     host: String,
     port: u16,
     socks5_port: u16,
-    /// `None` in `google_only` (bootstrap) mode: no Apps Script relay is
-    /// wired up, only the SNI-rewrite tunnel path is live.
+    /// `None` in `direct` mode: no Apps Script relay is wired up,
+    /// only the SNI-rewrite tunnel path (Google edge + any configured
+    /// `fronting_groups`) is live.
     fronter: Option<Arc<DomainFronter>>,
     mitm: Arc<Mutex<MitmCertManager>>,
     rewrite_ctx: Arc<RewriteCtx>,
     tunnel_mux: Option<Arc<TunnelMux>>,
+    coalesce_step_ms: u64,
+    coalesce_max_ms: u64,
 }
 
 pub struct RewriteCtx {
@@ -148,6 +237,146 @@ pub struct RewriteCtx {
     /// and pass through as plain TCP (optionally via upstream_socks5).
     /// See config.rs `passthrough_hosts` for matching rules. Issues #39, #127.
     pub passthrough_hosts: Vec<String>,
+    /// If true, drop SOCKS5 UDP datagrams destined for port 443 so
+    /// callers fall back to TCP/HTTPS. See config.rs `block_quic` for
+    /// the trade-off. Issue #213.
+    pub block_quic: bool,
+    pub block_stun: bool,
+    /// If true, route DoH CONNECTs around the Apps Script tunnel via
+    /// plain TCP. Default false via `Config::tunnel_doh = true` (flipped
+    /// in v1.9.0, issue #468). See `DEFAULT_DOH_HOSTS` and
+    /// `matches_doh_host` for matching, and config.rs `tunnel_doh` for
+    /// the trade-off.
+    pub bypass_doh: bool,
+    /// When true, immediately reject connections to known DoH hosts.
+    /// Takes priority over bypass_doh.
+    pub block_doh: bool,
+    /// User-supplied DoH hostnames added to the built-in default list.
+    /// Same matching semantics as `passthrough_hosts`.
+    pub bypass_doh_hosts: Vec<String>,
+    /// Multi-edge fronting groups, resolved at startup. Each group's
+    /// `ServerName` is parsed once so the per-connection dial path
+    /// is allocation-free. Wrapped in `Arc` so a per-CONNECT match
+    /// can hand the dispatcher a refcount-clone instead of cloning
+    /// the whole struct (which holds a `Vec<String>` of normalized
+    /// domains used only for matching). Empty = feature off (only
+    /// the built-in Google edge SNI-rewrite is active).
+    pub fronting_groups: Vec<Arc<FrontingGroupResolved>>,
+}
+
+/// True if `host` matches a known DoH endpoint — either the built-in
+/// `DEFAULT_DOH_HOSTS` list or a user-supplied entry in `extra`. Match
+/// is case-insensitive, and entries match either exactly OR as a
+/// dot-anchored suffix unconditionally (no leading-dot requirement,
+/// unlike `passthrough_hosts`). The DoH list is *always* about a
+/// service — every legitimate tenant subdomain of `cloudflare-dns.com`
+/// or a user's private `doh.acme.test` is a DoH endpoint, so requiring
+/// users to remember to write `.doh.acme.test` would be a footgun
+/// without an obvious benefit.
+fn host_matches_doh_entry(h: &str, entry: &str) -> bool {
+    let e = entry.trim().trim_end_matches('.').to_ascii_lowercase();
+    let e = e.strip_prefix('.').unwrap_or(&e);
+    if e.is_empty() {
+        return false;
+    }
+    h == e || h.ends_with(&format!(".{}", e))
+}
+
+pub fn matches_doh_host(host: &str, extra: &[String]) -> bool {
+    let h = host.to_ascii_lowercase();
+    let h = h.trim_end_matches('.');
+    if h.is_empty() {
+        return false;
+    }
+    if DEFAULT_DOH_HOSTS
+        .iter()
+        .any(|s| host_matches_doh_entry(h, s))
+    {
+        return true;
+    }
+    extra.iter().any(|s| host_matches_doh_entry(h, s))
+}
+
+/// A `FrontingGroup` after one-time validation: the group's `sni` is
+/// parsed into a `ServerName` so we don't repay that on every dialed
+/// connection, and domain entries are pre-lower-cased + dot-trimmed
+/// so the per-request match path is just byte comparisons.
+#[derive(Debug, Clone)]
+pub struct FrontingGroupResolved {
+    pub name: String,
+    pub ip: String,
+    pub sni: String,
+    pub server_name: ServerName<'static>,
+    domains_normalized: Vec<String>,
+}
+
+impl FrontingGroupResolved {
+    fn from_config(g: &FrontingGroup) -> Result<Self, String> {
+        let server_name = ServerName::try_from(g.sni.clone())
+            .map_err(|e| format!("invalid sni '{}': {}", g.sni, e))?;
+        let domains_normalized = g
+            .domains
+            .iter()
+            .map(|d| d.trim().trim_end_matches('.').to_ascii_lowercase())
+            .filter(|d| !d.is_empty())
+            .collect();
+        Ok(Self {
+            name: g.name.clone(),
+            ip: g.ip.clone(),
+            sni: g.sni.clone(),
+            server_name,
+            domains_normalized,
+        })
+    }
+}
+
+/// First fronting group whose domain list contains `host`, if any.
+/// Match is case-insensitive and unconditionally suffix-anchored: an
+/// entry `vercel.com` matches both `vercel.com` and `*.vercel.com`.
+/// This is the right shape for fronting because every legitimate
+/// subdomain of a fronted domain is itself fronted by the same edge
+/// — requiring users to spell out every subdomain would be a footgun.
+/// Same matching shape as the DoH host list. First match wins, so
+/// users can put more-specific groups earlier when entries would
+/// otherwise overlap.
+pub fn match_fronting_group<'a>(
+    host: &str,
+    groups: &'a [Arc<FrontingGroupResolved>],
+) -> Option<&'a Arc<FrontingGroupResolved>> {
+    if groups.is_empty() {
+        return None;
+    }
+    let h = host.to_ascii_lowercase();
+    let h = h.trim_end_matches('.');
+    if h.is_empty() {
+        return None;
+    }
+    for g in groups {
+        for d in &g.domains_normalized {
+            if is_dot_anchored_match(h, d) {
+                return Some(g);
+            }
+        }
+    }
+    None
+}
+
+/// True if `host` equals `entry` exactly OR is a strict dot-anchored
+/// suffix of it (i.e. `entry == "vercel.com"` matches `host ==
+/// "app.vercel.com"` but not `host == "xvercel.com"`). Both inputs
+/// must already be lowercase + trailing-dot trimmed; the function
+/// does no allocation, unlike the obvious `format!(".{}", entry)`
+/// implementation that allocates per call.
+#[inline]
+fn is_dot_anchored_match(host: &str, entry: &str) -> bool {
+    if host == entry {
+        return true;
+    }
+    let hb = host.as_bytes();
+    let eb = entry.as_bytes();
+    hb.len() > eb.len()
+        && hb.ends_with(eb)
+        && hb[hb.len() - eb.len() - 1] == b'.'
 }
 
 /// True if `host` matches any entry in the user's passthrough list.
@@ -181,16 +410,16 @@ impl ProxyServer {
             .mode_kind()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{e}")))?;
 
-        // `google_only` mode skips the Apps Script relay entirely, so we must
+        // `direct` mode skips the Apps Script relay entirely, so we must
         // not try to construct the DomainFronter — it errors on a missing
-        // `script_id`, which is exactly the state a bootstrapping user is in.
+        // `script_id`, which is exactly the state a direct-mode user is in.
         let fronter = match mode {
             Mode::AppsScript | Mode::Full => {
                 let f = DomainFronter::new(config)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
                 Some(Arc::new(f))
             }
-            Mode::GoogleOnly => None,
+            Mode::Direct => None,
         };
 
         let tls_config = if config.verify_ssl {
@@ -207,6 +436,68 @@ impl ProxyServer {
         };
         let tls_connector = TlsConnector::from(Arc::new(tls_config));
 
+        // Surface a config combo that is otherwise silently inert: extras
+        // listed under `bypass_doh_hosts` only take effect when the bypass
+        // itself is on. A user who set `tunnel_doh: true` *and* populated
+        // the extras list almost certainly didn't mean to disable the
+        // feature their custom hosts feed into.
+        if config.tunnel_doh && !config.bypass_doh_hosts.is_empty() {
+            tracing::warn!(
+                "config: bypass_doh_hosts has {} entries but tunnel_doh=true — \
+                 the bypass is off, so the extras have no effect. Set \
+                 tunnel_doh=false (or omit it) to use them.",
+                config.bypass_doh_hosts.len()
+            );
+        }
+
+        // Same-shape warning for fronting_groups in full mode. The dispatch
+        // short-circuits to the tunnel mux before the fronting_groups check
+        // (full mode preserves end-to-end TLS, fronting_groups requires
+        // MITM), so groups configured here will never fire. Surface this
+        // at startup rather than letting users wonder why their Vercel
+        // domains never hit the configured edge.
+        if mode == Mode::Full && !config.fronting_groups.is_empty() {
+            tracing::warn!(
+                "config: fronting_groups has {} entries but mode=full — \
+                 full mode tunnels everything end-to-end through Apps Script \
+                 (no MITM), so groups never fire. Switch to mode=apps_script \
+                 or mode=direct to use them, or remove the groups to silence \
+                 this warning.",
+                config.fronting_groups.len()
+            );
+        }
+
+        let mut fronting_groups: Vec<Arc<FrontingGroupResolved>> =
+            Vec::with_capacity(config.fronting_groups.len());
+        let mut seen_names: std::collections::HashSet<String> = Default::default();
+        for g in &config.fronting_groups {
+            let resolved = FrontingGroupResolved::from_config(g).map_err(|e| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("fronting_groups['{}']: {}", g.name, e),
+                )
+            })?;
+            // Surface duplicate group names at startup. Not a hard
+            // error — copy-pasted configs can land here legitimately
+            // — but log lines key on `name` and dedup ambiguity makes
+            // them unreadable.
+            if !seen_names.insert(resolved.name.clone()) {
+                tracing::warn!(
+                    "fronting group name '{}' is used by more than one group; \
+                     log lines that reference the name will be ambiguous",
+                    resolved.name
+                );
+            }
+            tracing::info!(
+                "fronting group '{}': sni={} ip={} domains={}",
+                resolved.name,
+                resolved.sni,
+                resolved.ip,
+                resolved.domains_normalized.len()
+            );
+            fronting_groups.push(Arc::new(resolved));
+        }
+
         let rewrite_ctx = Arc::new(RewriteCtx {
             google_ip: config.google_ip.clone(),
             front_domain: config.front_domain.clone(),
@@ -216,6 +507,12 @@ impl ProxyServer {
             mode,
             youtube_via_relay: config.youtube_via_relay,
             passthrough_hosts: config.passthrough_hosts.clone(),
+            block_quic: config.block_quic,
+            block_stun: config.block_stun,
+            bypass_doh: !config.tunnel_doh,
+            block_doh: config.block_doh,
+            bypass_doh_hosts: config.bypass_doh_hosts.clone(),
+            fronting_groups,
         });
 
         let socks5_port = config.socks5_port.unwrap_or(config.listen_port + 1);
@@ -228,6 +525,8 @@ impl ProxyServer {
             mitm,
             rewrite_ctx,
             tunnel_mux: None, // initialized in run() inside the tokio runtime
+            coalesce_step_ms: if config.coalesce_step_ms > 0 { config.coalesce_step_ms as u64 } else { 10 },
+            coalesce_max_ms: if config.coalesce_max_ms > 0 { config.coalesce_max_ms as u64 } else { 1000 },
         })
     }
 
@@ -241,7 +540,7 @@ impl ProxyServer {
         // Initialize TunnelMux inside the runtime (tokio::spawn requires it).
         if self.rewrite_ctx.mode == Mode::Full {
             if let Some(f) = self.fronter.as_ref() {
-                self.tunnel_mux = Some(TunnelMux::start(f.clone()));
+                self.tunnel_mux = Some(TunnelMux::start(f.clone(), self.coalesce_step_ms, self.coalesce_max_ms));
             }
         }
 
@@ -259,13 +558,53 @@ impl ProxyServer {
         );
         // Pre-warm the outbound connection pool so the user's first request
         // doesn't pay a fresh TLS handshake to Google edge. Best-effort;
-        // failures are logged and ignored. Skipped in `google_only` — there
-        // is no fronter to warm.
+        // failures are logged and ignored. Skipped in `direct` mode —
+        // there is no fronter to warm.
+        //
+        // Sized to roughly match a browser's parallel-connection burst at
+        // startup. The previous fixed `3` was fine for a single deployment
+        // but left requests 4-10 of the opening burst paying a cold TLS
+        // handshake each (~300ms). Scaling with deployment count gives
+        // multi-account configs a proportionally warmer pool, capped so
+        // single-deployment users don't hammer Google edge unnecessarily.
         if let Some(warm_fronter) = self.fronter.clone() {
+            let n = warm_fronter.num_scripts().clamp(6, 16);
             tokio::spawn(async move {
-                warm_fronter.warm(3).await;
+                warm_fronter.warm(n).await;
             });
         }
+
+        // Apps Script container keepalive. `warm()` above keeps the TCP
+        // pool warm at startup, but the V8 container behind UrlFetchApp
+        // goes cold after ~5min idle and costs 1-3s to wake. A periodic
+        // HEAD ping prevents the cold-start lag on the first request
+        // after a quiet pause (most visible as YouTube player stalls).
+        // Skipped in direct mode for the same reason as warm —
+        // there's no fronter to ping.
+        //
+        // The handle is captured (not fire-and-forget) so the shutdown
+        // arm of the select! below can abort it. Without that, hitting
+        // Stop in the UI would leave the keepalive holding an
+        // Arc<DomainFronter> on stale config and pinging Apps Script
+        // every 240s — same class of bug that issue #99 hit for the
+        // accept loops.
+        let keepalive_task = if let Some(keepalive_fronter) = self.fronter.clone() {
+            tokio::spawn(async move {
+                keepalive_fronter.run_keepalive().await;
+            })
+        } else {
+            tokio::spawn(async move { std::future::pending::<()>().await })
+        };
+
+        // Background pool refill: keeps at least POOL_MIN ready TLS
+        // connections so acquire() never pays a cold handshake.
+        let refill_task = if let Some(refill_fronter) = self.fronter.clone() {
+            tokio::spawn(async move {
+                refill_fronter.run_pool_refill().await;
+            })
+        } else {
+            tokio::spawn(async move { std::future::pending::<()>().await })
+        };
 
         let stats_task = if let Some(stats_fronter) = self.fronter.clone() {
             tokio::spawn(async move {
@@ -374,6 +713,8 @@ impl ProxyServer {
             _ = &mut shutdown_rx => {
                 tracing::info!("Shutdown signal received, stopping listeners");
                 stats_task.abort();
+                keepalive_task.abort();
+                refill_task.abort();
                 http_task.abort();
                 socks_task.abort();
             }
@@ -447,8 +788,26 @@ async fn handle_http_client(
     tunnel_mux: Option<Arc<TunnelMux>>,
 ) -> std::io::Result<()> {
     let (head, leftover) = match read_http_head(&mut sock).await? {
-        Some(v) => v,
-        None => return Ok(()),
+        HeadReadResult::Got { head, leftover } => (head, leftover),
+        HeadReadResult::Closed => return Ok(()),
+        HeadReadResult::Oversized => {
+            // Reply with 431 instead of just dropping the socket so the
+            // browser shows a real error rather than retrying the same
+            // oversized request in a loop.
+            tracing::warn!(
+                "request head exceeds {} bytes — refusing with 431",
+                MAX_HEADER_BYTES
+            );
+            let _ = sock
+                .write_all(
+                    b"HTTP/1.1 431 Request Header Fields Too Large\r\n\
+                      Connection: close\r\n\
+                      Content-Length: 0\r\n\r\n",
+                )
+                .await;
+            let _ = sock.flush().await;
+            return Ok(());
+        }
     };
 
     let (method, target, _version, _headers) = parse_request_head(&head)
@@ -456,30 +815,41 @@ async fn handle_http_client(
 
     if method.eq_ignore_ascii_case("CONNECT") {
         let (host, port) = parse_host_port(&target);
+        // Mirror the SOCKS5 short-circuit: if the tunnel-node just failed
+        // this (host, port) with unreachable, return 502 immediately rather
+        // than acknowledging the CONNECT and blowing tunnel quota on a
+        // guaranteed retry. See `TunnelMux::is_unreachable` for context.
+        if let Some(ref mux) = tunnel_mux {
+            if mux.is_unreachable(&host, port) {
+                tracing::info!("CONNECT {}:{} (negative-cached, refusing)", host, port);
+                let _ = sock
+                    .write_all(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await;
+                let _ = sock.flush().await;
+                return Ok(());
+            }
+        }
         sock.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await?;
         sock.flush().await?;
         dispatch_tunnel(sock, host, port, fronter, mitm, rewrite_ctx, tunnel_mux).await
     } else {
-        // Plain HTTP proxy request (e.g. `GET http://…`). The Apps Script
-        // relay is the only code path that can fulfil this, so in google_only
-        // bootstrap mode we return a clear 502 instead.
+        // Plain HTTP proxy request (e.g. `GET http://…`).
+        //
+        // apps_script mode: relay through the Apps Script fronter (which
+        // is the whole point of the relay).
+        //
+        // direct mode: no fronter exists, so passthrough as raw TCP.
+        // Same contract as `dispatch_tunnel` honors for CONNECT in
+        // direct mode — anything not on the Google edge / not in a
+        // configured fronting_group is forwarded direct (or via
+        // `upstream_socks5`) so the user's browser still works while
+        // they finish setting up Apps Script. Issue: typing a bare
+        // `http://example.com` URL used to return a 502 here even
+        // though `https://example.com` (CONNECT) worked fine.
         match fronter {
             Some(f) => do_plain_http(sock, &head, &leftover, f).await,
-            None => {
-                let _ = sock
-                    .write_all(
-                        b"HTTP/1.1 502 Bad Gateway\r\n\
-                          Content-Type: text/plain; charset=utf-8\r\n\
-                          Content-Length: 120\r\n\
-                          Connection: close\r\n\r\n\
-                          google_only mode: plain HTTP proxy requests are not supported. \
-                          Browse https over CONNECT, or switch to apps_script mode.",
-                    )
-                    .await;
-                let _ = sock.flush().await;
-                Ok(())
-            }
+            None => do_plain_http_passthrough(sock, &head, &leftover, &rewrite_ctx).await,
         }
     }
 }
@@ -557,6 +927,32 @@ async fn handle_socks5_client(
         return handle_socks5_udp_associate(sock, rewrite_ctx, tunnel_mux).await;
     }
 
+    // Negative-cache short-circuit: if the tunnel-node just failed to reach
+    // this exact (host, port) with `Network is unreachable` / `No route to
+    // host`, reply 0x04 (Host unreachable) immediately. Saves a 1.5–2s tunnel
+    // round-trip on guaranteed-failing targets — the IPv6 probe retry loop
+    // is the main offender on devices without IPv6.
+    if let Some(ref mux) = tunnel_mux {
+        if mux.is_unreachable(&host, port) {
+            tracing::info!("SOCKS5 CONNECT -> {}:{} (negative-cached, refusing)", host, port);
+            sock.write_all(&[0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await?;
+            sock.flush().await?;
+            return Ok(());
+        }
+    }
+
+    // Reject STUN/TURN UDP ports immediately so WebRTC (Meet,
+    // Telegram calls) skips UDP ICE candidates and falls back to
+    // TCP TURN on :443 without waiting for a timeout.
+    if rewrite_ctx.block_stun && matches!(port, 3478 | 5349 | 19302) {
+        tracing::info!("SOCKS5 CONNECT -> {}:{} (STUN/TURN blocked, forcing TCP fallback)", host, port);
+        sock.write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await?;
+        sock.flush().await?;
+        return Ok(());
+    }
+
     tracing::info!("SOCKS5 CONNECT -> {}:{}", host, port);
 
     // Success reply with zeroed BND.
@@ -583,7 +979,7 @@ struct SocksUdpTarget {
 /// to abort mid-await.
 struct UdpRelaySession {
     sid: String,
-    uplink: mpsc::Sender<Vec<u8>>,
+    uplink: mpsc::Sender<Bytes>,
 }
 
 /// All per-ASSOCIATE UDP relay state behind a single mutex so insertion
@@ -609,7 +1005,7 @@ impl UdpRelayState {
         }
     }
 
-    fn get_uplink(&self, target: &SocksUdpTarget) -> Option<mpsc::Sender<Vec<u8>>> {
+    fn get_uplink(&self, target: &SocksUdpTarget) -> Option<mpsc::Sender<Bytes>> {
         self.sessions.get(target).map(|s| s.uplink.clone())
     }
 
@@ -736,7 +1132,15 @@ async fn handle_socks5_udp_associate(
         client_peer_ip
     );
 
-    let mut buf = vec![0u8; SOCKS5_UDP_RECV_BUF_BYTES];
+    // Fixed reusable recv buffer. We deliberately don't go the
+    // `BytesMut::split().freeze()` route here even though `tunnel_loop`
+    // does: in TCP the read region IS the payload, but UDP always
+    // slices the SOCKS5 header off, so we'd be copying out anyway —
+    // and a frozen `Bytes` from the recv buf would refcount-pin the
+    // full ~65 KB allocation behind a tiny DNS reply, ballooning
+    // memory under bursts. Right-sized `Bytes::copy_from_slice` on
+    // accepted payloads keeps retention proportional to actual data.
+    let mut recv_buf = vec![0u8; SOCKS5_UDP_RECV_BUF_BYTES];
     let mut control_buf = [0u8; 1];
     let mut client_addr: Option<SocketAddr> = None;
     let state: Arc<Mutex<UdpRelayState>> = Arc::new(Mutex::new(UdpRelayState::new()));
@@ -752,7 +1156,7 @@ async fn handle_socks5_udp_associate(
 
     loop {
         tokio::select! {
-            recv = udp.recv_from(&mut buf) => {
+            recv = udp.recv_from(&mut recv_buf) => {
                 let (n, peer) = match recv {
                     Ok(v) => v,
                     Err(e) => {
@@ -760,6 +1164,7 @@ async fn handle_socks5_udp_associate(
                         break;
                     }
                 };
+
                 // Source-IP check: anything not from the SOCKS5 client's
                 // host is dropped silently.
                 if peer.ip() != client_peer_ip {
@@ -780,9 +1185,34 @@ async fn handle_socks5_udp_associate(
                 // can race one bad packet to DoS the legitimate client
                 // (whose real datagram, sent from a different ephemeral
                 // port, would then be silently rejected).
-                let Some((target, payload)) = parse_socks5_udp_packet(&buf[..n]) else {
+                let Some((target, payload_off)) = parse_socks5_udp_packet_offsets(&recv_buf[..n]) else {
                     continue;
                 };
+                let payload_slice = &recv_buf[payload_off..n];
+
+                // Issue #213: client-side QUIC block. UDP/443 is
+                // HTTP/3 — drop the datagram silently so the client
+                // stack retries a couple of times and then falls back
+                // to TCP/HTTPS, which goes through the regular CONNECT
+                // path. Skipping this at the SOCKS5 layer (rather than
+                // letting it hit the tunnel-node) avoids paying the
+                // 200–500 ms tunnel-node round-trip per dropped QUIC
+                // datagram, which would otherwise compound during the
+                // 1–3 retries before the browser falls back.
+                //
+                // Silent drop instead of an explicit error reply: the
+                // SOCKS5 UDP wire has no "destination unreachable"
+                // datagram — `0x04` only exists in TCP CONNECT replies
+                // (RFC 1928 §6). The browser's QUIC stack already has
+                // a "no response → fall back" timeout, so silent drop
+                // is the contractually correct shape.
+                if rewrite_ctx.block_quic && target.port == 443 {
+                    tracing::debug!(
+                        "udp dropped: block_quic=true, target {}:443",
+                        target.host
+                    );
+                    continue;
+                }
 
                 // RFC 1928 §6: lock to the first VALID datagram's source
                 // port. Subsequent datagrams must come from the same
@@ -800,19 +1230,26 @@ async fn handle_socks5_udp_associate(
                 // the mux. Each datagram costs ~payload * 1.33 in the
                 // batched JSON envelope plus tunnel-node CPU; uncapped,
                 // a runaway client can exhaust Apps Script quota.
-                if payload.len() > MAX_UDP_PAYLOAD_BYTES {
+                if payload_slice.len() > MAX_UDP_PAYLOAD_BYTES {
                     oversized_dropped += 1;
                     if oversized_dropped == 1 || oversized_dropped.is_multiple_of(100) {
                         tracing::debug!(
                             "udp datagram dropped: {} B > {} B (count={})",
-                            payload.len(),
+                            payload_slice.len(),
                             MAX_UDP_PAYLOAD_BYTES,
                             oversized_dropped,
                         );
                     }
                     continue;
                 }
-                let payload = payload.to_vec();
+
+                // Right-sized copy: the queued/in-flight payload owns its
+                // own allocation, so the recv buffer can be reused on the
+                // next iteration without keeping every queued datagram
+                // alive. Sized to the actual payload (≤ MAX_UDP_PAYLOAD_BYTES
+                // = 9 KB after the guard above), not the full ~65 KB recv
+                // buffer.
+                let payload = Bytes::copy_from_slice(payload_slice);
 
                 // Fast path: existing session — push payload onto its
                 // bounded uplink queue, drop on overflow (UDP semantics).
@@ -886,7 +1323,7 @@ async fn handle_socks5_udp_associate(
                     continue;
                 }
 
-                let (uplink_tx, uplink_rx) = mpsc::channel::<Vec<u8>>(UDP_UPLINK_QUEUE);
+                let (uplink_tx, uplink_rx) = mpsc::channel::<Bytes>(UDP_UPLINK_QUEUE);
                 let task_mux = mux.clone();
                 let task_udp = udp.clone();
                 let task_target = target.clone();
@@ -959,7 +1396,7 @@ async fn udp_session_task(
     sid: String,
     target: SocksUdpTarget,
     client_addr: SocketAddr,
-    mut uplink_rx: mpsc::Receiver<Vec<u8>>,
+    mut uplink_rx: mpsc::Receiver<Bytes>,
 ) {
     let mut backoff = UDP_INITIAL_POLL_DELAY;
     loop {
@@ -1067,7 +1504,20 @@ async fn write_socks5_reply(
     sock.flush().await
 }
 
-fn parse_socks5_udp_packet(buf: &[u8]) -> Option<(SocksUdpTarget, &[u8])> {
+/// Parse the SOCKS5 UDP frame header and return the target plus the byte
+/// offset at which the payload starts. Splitting "structure parsing"
+/// from "give me a payload slice" lets the recv hot path stay on a
+/// fixed reusable `Vec<u8>` buffer and only allocate a right-sized
+/// `Bytes::copy_from_slice(&recv_buf[off..n])` for accepted payloads
+/// (after the size guard). DO NOT change this back to a zero-copy
+/// `Bytes::slice` path: that was tried and reverted because slicing
+/// the recv buffer with `bytes` 1.x refcounts the whole ~65 KB
+/// allocation, so a queued tiny DNS reply pinned the full datagram-
+/// sized buffer until it drained — burst retention regressed by
+/// orders of magnitude on UDP-heavy workloads. The thin
+/// `parse_socks5_udp_packet` wrapper below keeps existing `&[u8]`
+/// callers (tests) working.
+fn parse_socks5_udp_packet_offsets(buf: &[u8]) -> Option<(SocksUdpTarget, usize)> {
     if buf.len() < 4 || buf[0] != 0 || buf[1] != 0 || buf[2] != 0 {
         return None;
     }
@@ -1122,8 +1572,13 @@ fn parse_socks5_udp_packet(buf: &[u8]) -> Option<(SocksUdpTarget, &[u8])> {
             atyp,
             addr,
         },
-        &buf[pos..],
+        pos,
     ))
+}
+
+fn parse_socks5_udp_packet(buf: &[u8]) -> Option<(SocksUdpTarget, &[u8])> {
+    let (target, off) = parse_socks5_udp_packet_offsets(buf)?;
+    Some((target, &buf[off..]))
 }
 
 fn build_socks5_udp_packet(target: &SocksUdpTarget, payload: &[u8]) -> Vec<u8> {
@@ -1190,6 +1645,40 @@ async fn dispatch_tunnel(
         return Ok(());
     }
 
+    // 0.4. DoH block. Reject connections to known DoH endpoints so browsers
+    //      fall back to system DNS (tun2proxy virtual DNS — instant).
+    //      Takes priority over bypass_doh.
+    if rewrite_ctx.block_doh
+        && port == 443
+        && matches_doh_host(&host, &rewrite_ctx.bypass_doh_hosts)
+    {
+        tracing::info!("dispatch {}:{} -> blocked (block_doh)", host, port);
+        drop(sock);
+        return Ok(());
+    }
+
+    // 0.5. DoH bypass. DNS-over-HTTPS is the dominant per-flow DNS cost
+    //      in Full mode (every browser name lookup costs a ~2 s Apps
+    //      Script round-trip), and the tunnel adds no privacy beyond
+    //      what DoH already provides. Route known DoH hosts directly.
+    //      Port-gated to 443 so a non-TLS CONNECT to e.g. `dns.google:80`
+    //      doesn't get diverted off-tunnel by accident.
+    //      See `DEFAULT_DOH_HOSTS` and config.rs `tunnel_doh`.
+    if rewrite_ctx.bypass_doh
+        && port == 443
+        && matches_doh_host(&host, &rewrite_ctx.bypass_doh_hosts)
+    {
+        let via = rewrite_ctx.upstream_socks5.as_deref();
+        tracing::info!(
+            "dispatch {}:{} -> raw-tcp ({}) (doh bypass)",
+            host,
+            port,
+            via.unwrap_or("direct")
+        );
+        plain_tcp_passthrough(sock, &host, port, via).await;
+        return Ok(());
+    }
+
     // 1. Full tunnel mode: ALL traffic goes through the batch multiplexer
     //    (Apps Script → tunnel node → real TCP). No MITM, no cert.
     if rewrite_ctx.mode == Mode::Full {
@@ -1209,6 +1698,40 @@ async fn dispatch_tunnel(
         return Ok(());
     }
 
+    // 2a. User-configured fronting groups (Vercel, Fastly, etc.). Wins
+    //     over the built-in Google SNI-rewrite suffix list — if a user
+    //     adds e.g. `vercel.com` to a Vercel fronting group, we hit
+    //     Vercel's edge with sni=react.dev rather than trying to resolve
+    //     it through Google's. Port-gated to 443: SNI-rewrite needs a
+    //     real ClientHello and a non-TLS CONNECT to the same hostname
+    //     would just hang. Only HTTPS sites are fronted by these CDNs in
+    //     practice, so the gate has no false negatives we care about.
+    if port == 443 {
+        // `Arc::clone` here is refcount-only; we hold it across the
+        // await below without keeping `rewrite_ctx` borrowed.
+        let group_match =
+            match_fronting_group(&host, &rewrite_ctx.fronting_groups).map(Arc::clone);
+        if let Some(group) = group_match {
+            tracing::info!(
+                "dispatch {}:{} -> sni-rewrite tunnel (fronting group '{}', edge {} sni={})",
+                host,
+                port,
+                group.name,
+                group.ip,
+                group.sni
+            );
+            return do_sni_rewrite_tunnel_from_tcp(
+                sock,
+                &host,
+                port,
+                mitm,
+                rewrite_ctx,
+                Some(group),
+            )
+            .await;
+        }
+    }
+
     // 2. Explicit hosts override or SNI-rewrite suffix: for HTTPS targets,
     //    use the TLS SNI-rewrite tunnel (skipped in full mode above).
     if should_use_sni_rewrite(
@@ -1222,17 +1745,18 @@ async fn dispatch_tunnel(
             host,
             port
         );
-        return do_sni_rewrite_tunnel_from_tcp(sock, &host, port, mitm, rewrite_ctx).await;
+        return do_sni_rewrite_tunnel_from_tcp(sock, &host, port, mitm, rewrite_ctx, None).await;
     }
 
-    // 3. google_only bootstrap: no Apps Script relay exists. Anything that
-    //    isn't SNI-rewrite-matched gets direct TCP passthrough so the user's
-    //    browser still works while they're deploying Code.gs. They'd switch
-    //    to apps_script mode for the real DPI bypass.
-    if rewrite_ctx.mode == Mode::GoogleOnly {
+    // 3. direct mode: no Apps Script relay exists. Anything that isn't
+    //    SNI-rewrite-matched (Google edge or a configured fronting_group)
+    //    gets raw TCP passthrough so the user's browser still works while
+    //    they're deploying Code.gs. They'd switch to apps_script mode for
+    //    full DPI bypass.
+    if rewrite_ctx.mode == Mode::Direct {
         let via = rewrite_ctx.upstream_socks5.as_deref();
         tracing::info!(
-            "dispatch {}:{} -> raw-tcp ({}) (google_only: no relay)",
+            "dispatch {}:{} -> raw-tcp ({}) (direct mode: no relay)",
             host,
             port,
             via.unwrap_or("direct")
@@ -1499,14 +2023,35 @@ fn looks_like_http(first_bytes: &[u8]) -> bool {
 /// Read an HTTP head (request line + headers) up to the first \r\n\r\n.
 /// Returns (head_bytes, leftover_after_head). The leftover may contain part
 /// of the request body already received.
-async fn read_http_head(sock: &mut TcpStream) -> std::io::Result<Option<(Vec<u8>, Vec<u8>)>> {
+/// Maximum size of an HTTP request head (request line + all headers).
+///
+/// Set to match upstream Python's `MAX_HEADER_BYTES` (64 KB,
+/// masterking32/MasterHttpRelayVPN constants.py). Real browsers
+/// virtually never exceed ~16 KB; anything past 64 KB is either a
+/// buggy client or a deliberate slowloris-style header bomb.
+/// Previously 1 MB, which let a misbehaving client allocate a lot
+/// of memory before failing.
+const MAX_HEADER_BYTES: usize = 64 * 1024;
+
+/// Result of `read_http_head` / `read_http_head_io`.
+/// `Oversized` is distinct from other I/O errors so the caller can
+/// reply with `431 Request Header Fields Too Large` instead of just
+/// dropping the connection (which a browser would silently retry,
+/// reproducing the same problem).
+enum HeadReadResult {
+    Got { head: Vec<u8>, leftover: Vec<u8> },
+    Closed,
+    Oversized,
+}
+
+async fn read_http_head(sock: &mut TcpStream) -> std::io::Result<HeadReadResult> {
     let mut buf = Vec::with_capacity(4096);
     let mut tmp = [0u8; 4096];
     loop {
         let n = sock.read(&mut tmp).await?;
         if n == 0 {
             return if buf.is_empty() {
-                Ok(None)
+                Ok(HeadReadResult::Closed)
             } else {
                 Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
@@ -1518,13 +2063,10 @@ async fn read_http_head(sock: &mut TcpStream) -> std::io::Result<Option<(Vec<u8>
         if let Some(pos) = find_headers_end(&buf) {
             let head = buf[..pos].to_vec();
             let leftover = buf[pos..].to_vec();
-            return Ok(Some((head, leftover)));
+            return Ok(HeadReadResult::Got { head, leftover });
         }
-        if buf.len() > 1024 * 1024 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "headers too large",
-            ));
+        if buf.len() > MAX_HEADER_BYTES {
+            return Ok(HeadReadResult::Oversized);
         }
     }
 }
@@ -1680,17 +2222,37 @@ async fn do_sni_rewrite_tunnel_from_tcp(
     port: u16,
     mitm: Arc<Mutex<MitmCertManager>>,
     rewrite_ctx: Arc<RewriteCtx>,
+    // When Some, overrides the default Google edge target with a
+    // user-configured fronting group's (ip, sni). `Arc` so the
+    // dispatcher hands us a refcount-only clone — the resolved
+    // group also carries the matcher's normalized domain list which
+    // we don't need here. None = built-in Google edge path.
+    group: Option<Arc<FrontingGroupResolved>>,
 ) -> std::io::Result<()> {
-    let target_ip = hosts_override(&rewrite_ctx.hosts, host)
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| rewrite_ctx.google_ip.clone());
+    let (target_ip, outbound_sni, server_name) = match &group {
+        Some(g) => (g.ip.clone(), g.sni.clone(), g.server_name.clone()),
+        None => {
+            let ip = hosts_override(&rewrite_ctx.hosts, host)
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| rewrite_ctx.google_ip.clone());
+            let sni = rewrite_ctx.front_domain.clone();
+            let sn = match ServerName::try_from(sni.clone()) {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::error!("invalid front_domain '{}': {}", sni, e);
+                    return Ok(());
+                }
+            };
+            (ip, sni, sn)
+        }
+    };
 
     tracing::info!(
         "SNI-rewrite tunnel -> {}:{} via {} (outbound SNI={})",
         host,
         port,
         target_ip,
-        rewrite_ctx.front_domain
+        outbound_sni
     );
 
     // Accept browser TLS with a cert we sign for `host`.
@@ -1734,13 +2296,6 @@ async fn do_sni_rewrite_tunnel_from_tcp(
     };
     let _ = upstream_tcp.set_nodelay(true);
 
-    let server_name = match ServerName::try_from(rewrite_ctx.front_domain.clone()) {
-        Ok(n) => n,
-        Err(e) => {
-            tracing::error!("invalid front_domain '{}': {}", rewrite_ctx.front_domain, e);
-            return Ok(());
-        }
-    };
     let outbound = match rewrite_ctx
         .tls_connector
         .connect(server_name, upstream_tcp)
@@ -1833,8 +2388,31 @@ where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let (head, leftover) = match read_http_head_io(stream).await? {
-        Some(v) => v,
-        None => return Ok(false),
+        HeadReadResult::Got { head, leftover } => (head, leftover),
+        HeadReadResult::Closed => return Ok(false),
+        HeadReadResult::Oversized => {
+            // Inside MITM: same reasoning as the plaintext path. Return
+            // 431 over the decrypted stream so the browser surfaces a
+            // real error to the user instead of looping a connection
+            // reset, which was the symptom upstream caught (Apps Script
+            // ate malformed JSON when truncated header blocks were
+            // forwarded blindly).
+            tracing::warn!(
+                "MITM header block exceeds {} bytes — closing ({}:{})",
+                MAX_HEADER_BYTES,
+                host,
+                port
+            );
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 431 Request Header Fields Too Large\r\n\
+                      Connection: close\r\n\
+                      Content-Length: 0\r\n\r\n",
+                )
+                .await;
+            let _ = stream.flush().await;
+            return Ok(false);
+        }
     };
 
     let (method, path, _version, headers) = match parse_request_head(&head) {
@@ -1862,7 +2440,7 @@ where
     // pourya-p's log in #64 showed the real Host header. Match every
     // subdomain of x.com here.
     let host_lower = host.to_ascii_lowercase();
-    let is_x_com = host_lower == "x.com" || host_lower.ends_with(".x.com");
+    let is_x_com = host_lower == "x.com" || host_lower.ends_with(".x.com") || host_lower == "twitter.com" || host_lower.ends_with(".twitter.com");
     let path = if is_x_com && path.starts_with("/i/api/graphql/") && path.contains("?variables=") {
         match path.split_once('&') {
             Some((short, _)) => {
@@ -1930,6 +2508,32 @@ where
 
     tracing::info!("relay {} {}", method, url);
 
+    // CORS response-header injection. The preflight short-circuit
+    // above handles `OPTIONS`, but the *actual* fetch that follows
+    // also needs CORS-compliant headers on the way back, or the
+    // browser drops the response and the JS layer sees a CORS
+    // failure. Apps Script's `UrlFetchApp.fetch()` preserves the
+    // origin server's response headers inconsistently — sometimes the
+    // destination returns `Access-Control-Allow-Origin: *` (which is
+    // incompatible with `Allow-Credentials: true`), sometimes omits
+    // ACL headers entirely. The visible symptom on YouTube is comments
+    // not loading and the "restricted" gate firing on cross-origin
+    // XHR responses that the browser rejected before the JS handler
+    // could even read them. Idea credit: ThisIsDara/mhr-cfw-go.
+    //
+    // Only injects when the request had an `Origin` header — non-CORS
+    // requests (top-level navigation, plain image fetches) don't need
+    // the headers and adding them would be noise. The relay response
+    // is otherwise byte-identical, so this never affects non-browser
+    // clients (curl, wget, app-level HTTP clients).
+    let cors_origin = header_value(&headers, "origin").map(|s| s.to_string());
+    let transform_head = |head: &[u8]| -> Vec<u8> {
+        match cors_origin.as_deref() {
+            Some(origin) => inject_cors_into_head(head, origin).unwrap_or_else(|| head.to_vec()),
+            None => head.to_vec(),
+        }
+    };
+
     // For GETs without a body, take the range-parallel path — probes
     // with `Range: bytes=0-<chunk>`, and if the origin supports ranges,
     // fetches the rest in parallel 256 KB chunks. This is what lets
@@ -1938,14 +2542,23 @@ where
     // Anything with a body (POST/PUT/PATCH) goes through the normal
     // relay path — range semantics on mutating requests are undefined
     // and would break form submissions.
-    let response = if method.eq_ignore_ascii_case("GET") && body.is_empty() {
+    //
+    // The range-parallel call writes directly to the stream so files
+    // above Apps Script's single-GET ceiling (~40 MiB) can stream
+    // through chunk-by-chunk instead of being buffered into one giant
+    // `Vec<u8>` (which previously failed for 100 MiB+ downloads — #1042).
+    if method.eq_ignore_ascii_case("GET") && body.is_empty() {
         fronter
-            .relay_parallel_range(&method, &url, &headers, &body)
-            .await
+            .relay_parallel_range_to(stream, &method, &url, &headers, &body, transform_head)
+            .await?;
     } else {
-        fronter.relay(&method, &url, &headers, &body).await
-    };
-    stream.write_all(&response).await?;
+        let response = fronter.relay(&method, &url, &headers, &body).await;
+        let response = match cors_origin.as_deref() {
+            Some(origin) => inject_cors_response_headers(&response, origin),
+            None => response,
+        };
+        stream.write_all(&response).await?;
+    }
     stream.flush().await?;
 
     // Keep-alive unless the client asked to close.
@@ -1955,7 +2568,7 @@ where
     Ok(!connection_close)
 }
 
-async fn read_http_head_io<S>(stream: &mut S) -> std::io::Result<Option<(Vec<u8>, Vec<u8>)>>
+async fn read_http_head_io<S>(stream: &mut S) -> std::io::Result<HeadReadResult>
 where
     S: tokio::io::AsyncRead + Unpin,
 {
@@ -1965,7 +2578,7 @@ where
         let n = stream.read(&mut tmp).await?;
         if n == 0 {
             return if buf.is_empty() {
-                Ok(None)
+                Ok(HeadReadResult::Closed)
             } else {
                 Err(std::io::Error::new(
                     std::io::ErrorKind::UnexpectedEof,
@@ -1977,13 +2590,10 @@ where
         if let Some(pos) = find_headers_end(&buf) {
             let head = buf[..pos].to_vec();
             let leftover = buf[pos..].to_vec();
-            return Ok(Some((head, leftover)));
+            return Ok(HeadReadResult::Got { head, leftover });
         }
-        if buf.len() > 1024 * 1024 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "headers too large",
-            ));
+        if buf.len() > MAX_HEADER_BYTES {
+            return Ok(HeadReadResult::Oversized);
         }
     }
 }
@@ -1993,6 +2603,99 @@ fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a s
         .iter()
         .find(|(k, _)| k.eq_ignore_ascii_case(name))
         .map(|(_, v)| v.as_str())
+}
+
+/// Strip any `Access-Control-*` response headers the origin server
+/// emitted (or that Apps Script's `UrlFetchApp.fetch()` may have
+/// mangled / dropped) and inject a permissive set keyed on the
+/// browser's request `Origin`. Returns a new response buffer; never
+/// mutates in place.
+///
+/// The body is preserved byte-for-byte; only the header block before
+/// the first `\r\n\r\n` is rewritten. If the response can't be parsed
+/// as HTTP/1.x (no header/body separator), it's returned unchanged so
+/// edge-case responses (e.g. raw error blobs from upstream) aren't
+/// corrupted.
+///
+/// Why permissive (`Allow-Methods: *`, `Allow-Headers: *`,
+/// `Expose-Headers: *`): the browser already pre-cleared the request
+/// via the preflight short-circuit (line ~2435), and the relay path
+/// doesn't expose anything that wasn't already going to the
+/// destination through the user's own MITM trust anchor. The wide
+/// permissions only relax browser-side CORS gating; they don't widen
+/// the underlying network reach. `Allow-Credentials: true` is
+/// echo-only-with-explicit-origin (spec requires it; `*` is invalid
+/// alongside credentials) — that's why we echo the request's origin
+/// and never use `*`.
+fn inject_cors_response_headers(response: &[u8], origin: &str) -> Vec<u8> {
+    // Find the header / body separator. If we can't parse the
+    // response as HTTP/1.x, hand it back unchanged.
+    let sep = b"\r\n\r\n";
+    let Some(idx) = response
+        .windows(sep.len())
+        .position(|w| w == sep)
+    else {
+        return response.to_vec();
+    };
+    let head_with_terminator = &response[..idx + sep.len()];
+    let body = &response[idx + sep.len()..];
+
+    let Some(mut buf) = inject_cors_into_head(head_with_terminator, origin) else {
+        return response.to_vec();
+    };
+    buf.extend_from_slice(body);
+    buf
+}
+
+/// Head-only variant of `inject_cors_response_headers`. Takes the head
+/// block of an HTTP/1.x response *including* the trailing `\r\n\r\n`
+/// separator and returns a rewritten head block, again including the
+/// `\r\n\r\n` terminator. Returns `None` if the head block isn't valid
+/// UTF-8 — the caller should pass the original bytes through unchanged
+/// in that case.
+///
+/// Split out so the range-parallel streaming path can apply CORS
+/// rewrites to the response head before the body has been assembled
+/// (where the buffered path could just rewrite the finished
+/// head+body blob).
+pub(crate) fn inject_cors_into_head(head_with_terminator: &[u8], origin: &str) -> Option<Vec<u8>> {
+    let sep = b"\r\n\r\n";
+    let head = head_with_terminator
+        .strip_suffix(sep)
+        .unwrap_or(head_with_terminator);
+    let head_str = std::str::from_utf8(head).ok()?;
+
+    let mut out = String::with_capacity(head.len() + 256);
+    let mut lines = head_str.split("\r\n");
+    if let Some(status) = lines.next() {
+        out.push_str(status);
+        out.push_str("\r\n");
+    }
+    // Rebuild the header block, dropping any pre-existing
+    // `Access-Control-*` lines so the destination's value can't
+    // conflict with ours.
+    for line in lines {
+        let lower = line.to_ascii_lowercase();
+        if lower.starts_with("access-control-") {
+            continue;
+        }
+        out.push_str(line);
+        out.push_str("\r\n");
+    }
+    // Inject our own. `Vary: Origin` tells downstream caches that the
+    // response varies per request origin (so CDN-shared caches don't
+    // serve one user's CORS-tagged response to a different origin).
+    out.push_str("Access-Control-Allow-Origin: ");
+    out.push_str(origin);
+    out.push_str("\r\n");
+    out.push_str("Access-Control-Allow-Credentials: true\r\n");
+    out.push_str("Access-Control-Allow-Methods: GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD\r\n");
+    out.push_str("Access-Control-Allow-Headers: *\r\n");
+    out.push_str("Access-Control-Expose-Headers: *\r\n");
+    out.push_str("Vary: Origin\r\n");
+    out.push_str("\r\n");
+
+    Some(out.into_bytes())
 }
 
 fn expects_100_continue(headers: &[(String, String)]) -> bool {
@@ -2190,17 +2893,194 @@ async fn do_plain_http(
     // Plain HTTP proxy path — same range-parallel strategy as the
     // MITM-HTTPS path above. Large downloads on port 80 (package
     // mirrors, video poster streams, etc.) need the same acceleration
-    // or the relay stalls per-chunk.
-    let response = if method.eq_ignore_ascii_case("GET") && body.is_empty() {
+    // or the relay stalls per-chunk. No CORS injection on this path —
+    // plain-http proxy traffic isn't a browser-MITM flow, so the
+    // origin's response headers go through unchanged.
+    if method.eq_ignore_ascii_case("GET") && body.is_empty() {
         fronter
-            .relay_parallel_range(&method, &url, &headers, &body)
-            .await
+            .relay_parallel_range_to(
+                &mut sock,
+                &method,
+                &url,
+                &headers,
+                &body,
+                |head: &[u8]| head.to_vec(),
+            )
+            .await?;
     } else {
-        fronter.relay(&method, &url, &headers, &body).await
-    };
-    sock.write_all(&response).await?;
+        let response = fronter.relay(&method, &url, &headers, &body).await;
+        sock.write_all(&response).await?;
+    }
     sock.flush().await?;
     Ok(())
+}
+
+/// `direct` mode plain-HTTP passthrough. The CONNECT path already
+/// falls through to raw TCP for hosts outside the SNI-rewrite set in
+/// `direct`; this is the same idea for the `GET http://…` proxy form
+/// so a bare `http://example.com` typed in the address bar doesn't 502.
+///
+/// We rewrite the absolute-form request URI (`GET http://host/path`) to
+/// origin form (`GET /path`), strip hop-by-hop headers, force
+/// `Connection: close` so a keep-alive client can't pipeline a request
+/// to a different host onto our spliced socket, then dial the origin
+/// (honoring `upstream_socks5` if set) and splice both directions.
+async fn do_plain_http_passthrough(
+    mut sock: TcpStream,
+    head: &[u8],
+    leftover: &[u8],
+    rewrite_ctx: &RewriteCtx,
+) -> std::io::Result<()> {
+    let (method, target, version, headers) = match parse_request_head(head) {
+        Some(v) => v,
+        None => return Ok(()),
+    };
+
+    let (host, port, path) = match resolve_plain_http_target(&target, &headers) {
+        Some(v) => v,
+        None => {
+            tracing::debug!("plain-http passthrough: cannot parse target {}", target);
+            return Ok(());
+        }
+    };
+
+    tracing::info!(
+        "dispatch http {}:{} -> raw-tcp ({}) (direct mode: no relay)",
+        host,
+        port,
+        rewrite_ctx.upstream_socks5.as_deref().unwrap_or("direct"),
+    );
+
+    // Rewrite request line to origin form and drop hop-by-hop headers.
+    let mut rewritten = Vec::with_capacity(head.len());
+    rewritten.extend_from_slice(method.as_bytes());
+    rewritten.push(b' ');
+    rewritten.extend_from_slice(path.as_bytes());
+    rewritten.push(b' ');
+    rewritten.extend_from_slice(version.as_bytes());
+    rewritten.extend_from_slice(b"\r\n");
+    for (k, v) in &headers {
+        let kl = k.to_ascii_lowercase();
+        if kl == "proxy-connection" || kl == "connection" || kl == "keep-alive" {
+            continue;
+        }
+        rewritten.extend_from_slice(k.as_bytes());
+        rewritten.extend_from_slice(b": ");
+        rewritten.extend_from_slice(v.as_bytes());
+        rewritten.extend_from_slice(b"\r\n");
+    }
+    rewritten.extend_from_slice(b"Connection: close\r\n\r\n");
+
+    let target_host = host.trim_start_matches('[').trim_end_matches(']');
+    let connect_timeout = if looks_like_ip(target_host) {
+        std::time::Duration::from_secs(4)
+    } else {
+        std::time::Duration::from_secs(10)
+    };
+    let upstream = if let Some(proxy) = rewrite_ctx.upstream_socks5.as_deref() {
+        match socks5_connect_via(proxy, target_host, port).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    "upstream-socks5 {} -> {}:{} failed: {} (falling back to direct)",
+                    proxy,
+                    host,
+                    port,
+                    e
+                );
+                match tokio::time::timeout(
+                    connect_timeout,
+                    TcpStream::connect((target_host, port)),
+                )
+                .await
+                {
+                    Ok(Ok(s)) => s,
+                    _ => return Ok(()),
+                }
+            }
+        }
+    } else {
+        match tokio::time::timeout(connect_timeout, TcpStream::connect((target_host, port))).await {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                tracing::debug!("plain-http connect {}:{} failed: {}", host, port, e);
+                return Ok(());
+            }
+            Err(_) => {
+                tracing::debug!("plain-http connect {}:{} timeout", host, port);
+                return Ok(());
+            }
+        }
+    };
+    let _ = upstream.set_nodelay(true);
+
+    let (mut ar, mut aw) = sock.split();
+    let (mut br, mut bw) = upstream.into_split();
+    bw.write_all(&rewritten).await?;
+    if !leftover.is_empty() {
+        bw.write_all(leftover).await?;
+    }
+    let t1 = tokio::io::copy(&mut ar, &mut bw);
+    let t2 = tokio::io::copy(&mut br, &mut aw);
+    tokio::select! {
+        _ = t1 => {}
+        _ = t2 => {}
+    }
+    Ok(())
+}
+
+/// Parse the target of a plain-HTTP proxy request line into
+/// `(host, port, origin-form-path)`. Browsers send absolute form
+/// (`http://host[:port]/path`); we also accept the origin-form
+/// fallback (`/path` with a `Host:` header) for transparent-proxy
+/// clients. `https://` is accepted defensively, though browsers route
+/// HTTPS through CONNECT and shouldn't hit this path.
+fn resolve_plain_http_target(
+    target: &str,
+    headers: &[(String, String)],
+) -> Option<(String, u16, String)> {
+    let (rest, default_port) = if let Some(r) = target.strip_prefix("http://") {
+        (r, 80u16)
+    } else if let Some(r) = target.strip_prefix("https://") {
+        (r, 443u16)
+    } else if target.starts_with('/') {
+        let host_header = headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("host"))
+            .map(|(_, v)| v.as_str())?;
+        let (host, port) = split_authority(host_header, 80);
+        return Some((host, port, target.to_string()));
+    } else {
+        return None;
+    };
+
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    if authority.is_empty() {
+        return None;
+    }
+    let (host, port) = split_authority(authority, default_port);
+    Some((host, port, path.to_string()))
+}
+
+/// Split an `authority` (`host[:port]`, with optional IPv6 brackets)
+/// into a `(host, port)` pair, defaulting the port when absent.
+fn split_authority(authority: &str, default_port: u16) -> (String, u16) {
+    // Bare IPv6 (multiple colons, no brackets) — `rsplit_once(':')`
+    // would otherwise mangle `::1` into `(":", 1)`. Take the whole
+    // string as the host and use the default port.
+    let colons = authority.bytes().filter(|&b| b == b':').count();
+    if colons > 1 && !authority.starts_with('[') {
+        return (authority.to_string(), default_port);
+    }
+    if let Some((h, p)) = authority.rsplit_once(':') {
+        if let Ok(port) = p.parse::<u16>() {
+            return (h.to_string(), port);
+        }
+    }
+    (authority.to_string(), default_port)
 }
 
 #[cfg(test)]
@@ -2213,6 +3093,63 @@ mod tests {
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect()
+    }
+
+    #[test]
+    fn resolve_plain_http_target_parses_absolute_form() {
+        let h = headers(&[]);
+        let (host, port, path) =
+            resolve_plain_http_target("http://example.com/", &h).unwrap();
+        assert_eq!(host, "example.com");
+        assert_eq!(port, 80);
+        assert_eq!(path, "/");
+
+        let (host, port, path) =
+            resolve_plain_http_target("http://example.com:8080/foo?x=1", &h).unwrap();
+        assert_eq!(host, "example.com");
+        assert_eq!(port, 8080);
+        assert_eq!(path, "/foo?x=1");
+
+        let (host, port, path) =
+            resolve_plain_http_target("http://example.com", &h).unwrap();
+        assert_eq!(host, "example.com");
+        assert_eq!(port, 80);
+        assert_eq!(path, "/");
+    }
+
+    #[test]
+    fn resolve_plain_http_target_falls_back_to_host_header() {
+        let h = headers(&[("Host", "example.com:8080")]);
+        let (host, port, path) = resolve_plain_http_target("/foo", &h).unwrap();
+        assert_eq!(host, "example.com");
+        assert_eq!(port, 8080);
+        assert_eq!(path, "/foo");
+    }
+
+    #[test]
+    fn resolve_plain_http_target_rejects_bare_authority() {
+        // No scheme, doesn't start with `/` — not something we can route.
+        assert!(resolve_plain_http_target("example.com", &headers(&[])).is_none());
+        assert!(resolve_plain_http_target("http://", &headers(&[])).is_none());
+    }
+
+    #[test]
+    fn split_authority_handles_ports_and_ipv6() {
+        assert_eq!(
+            split_authority("example.com", 80),
+            ("example.com".to_string(), 80)
+        );
+        assert_eq!(
+            split_authority("example.com:8080", 80),
+            ("example.com".to_string(), 8080)
+        );
+        assert_eq!(
+            split_authority("[::1]:8080", 80),
+            ("[::1]".to_string(), 8080)
+        );
+        // Bare IPv6 without brackets — keep the whole string as the host
+        // and use the default port instead of mis-splitting on a colon.
+        assert_eq!(split_authority("::1", 80), ("::1".to_string(), 80));
     }
 
     #[test]
@@ -2366,36 +3303,77 @@ mod tests {
 
     #[test]
     fn youtube_via_relay_routes_youtube_through_relay_path() {
-        // Issue #102. When youtube_via_relay=true, YouTube suffixes
-        // must NOT match the SNI-rewrite path, so traffic falls
-        // through to Apps Script relay. Other Google suffixes are
-        // unaffected.
+        // Issue #102 + #275. When youtube_via_relay=true:
+        //   - YouTube API + HTML hosts (where Restricted Mode lives)
+        //     opt out of SNI rewrite so they go through the relay.
+        //   - YouTube image / video / channel-asset CDNs STAY on SNI
+        //     rewrite — Restricted Mode isn't enforced on those, and
+        //     routing video chunks through Apps Script burns quota
+        //     and risks the 6-min execution cap. Pre-#275 ytimg.com
+        //     was incorrectly carved out alongside the API surfaces.
+        //   - Non-YouTube Google suffixes are unaffected by the flag.
         let hosts = std::collections::HashMap::new();
 
-        // Default behaviour: everything in the pool rewrites.
-        assert!(should_use_sni_rewrite(
-            &hosts,
-            "www.youtube.com",
-            443,
-            false
-        ));
+        // Default behaviour (flag off): everything in the SNI pool
+        // rewrites including all YouTube assets.
+        assert!(should_use_sni_rewrite(&hosts, "www.youtube.com", 443, false));
         assert!(should_use_sni_rewrite(&hosts, "i.ytimg.com", 443, false));
         assert!(should_use_sni_rewrite(&hosts, "youtu.be", 443, false));
         assert!(should_use_sni_rewrite(&hosts, "www.google.com", 443, false));
+        assert!(should_use_sni_rewrite(
+            &hosts,
+            "youtubei.googleapis.com",
+            443,
+            false
+        ));
 
-        // With the toggle on: YouTube opts out, Google stays.
+        // googlevideo.com is INTENTIONALLY NOT in SNI_REWRITE_SUFFIXES
+        // — see the long note at the top of the SNI list. v1.7.4 tried
+        // adding it; reverted in v1.7.6 after user reports of total
+        // YouTube breakage. If the project ever ships an EVA-edge-IP
+        // config knob, this assertion can flip. Until then, video
+        // chunks correctly fall through to the Apps Script relay path
+        // and this assertion guards against a regression.
         assert!(!should_use_sni_rewrite(
             &hosts,
-            "www.youtube.com",
+            "rr1---sn-abc.googlevideo.com",
+            443,
+            false
+        ));
+
+        // Flag on: only the API + HTML hosts opt out.
+        assert!(!should_use_sni_rewrite(&hosts, "www.youtube.com", 443, true));
+        assert!(!should_use_sni_rewrite(&hosts, "youtu.be", 443, true));
+        assert!(!should_use_sni_rewrite(
+            &hosts,
+            "www.youtube-nocookie.com",
             443,
             true
         ));
-        assert!(!should_use_sni_rewrite(&hosts, "i.ytimg.com", 443, true));
-        assert!(!should_use_sni_rewrite(&hosts, "youtu.be", 443, true));
+        assert!(!should_use_sni_rewrite(
+            &hosts,
+            "youtubei.googleapis.com",
+            443,
+            true
+        ));
+
+        // Flag on: image / channel-asset CDNs STAY on SNI rewrite. Pre-#275
+        // ytimg.com was incorrectly carved out alongside the API surfaces.
+        // googlevideo.com still goes through the relay path (not in the
+        // SNI list at all — see note above the SNI_REWRITE_SUFFIXES
+        // entries) so the same flag-on assertion isn't applicable to it.
+        assert!(should_use_sni_rewrite(&hosts, "i.ytimg.com", 443, true));
+        assert!(should_use_sni_rewrite(&hosts, "yt3.ggpht.com", 443, true));
+
+        // Flag on: non-YouTube Google suffixes are unaffected. Note
+        // youtubei.googleapis.com (above) is the *carve-out* — the
+        // broader googleapis.com suffix is NOT carved out, so e.g.
+        // Drive / Calendar / etc. continue to SNI-rewrite.
         assert!(should_use_sni_rewrite(&hosts, "www.google.com", 443, true));
+        assert!(should_use_sni_rewrite(&hosts, "fonts.gstatic.com", 443, true));
         assert!(should_use_sni_rewrite(
             &hosts,
-            "fonts.gstatic.com",
+            "drive.googleapis.com",
             443,
             true
         ));
@@ -2445,6 +3423,69 @@ mod tests {
     }
 
     #[test]
+    fn inject_cors_response_headers_replaces_existing_acl_with_origin_echo() {
+        // Origin server returned `Access-Control-Allow-Origin: *` which
+        // browsers reject when paired with `Allow-Credentials: true` (the
+        // YouTube comments failure mode). Our injection must strip the
+        // wildcard and substitute the request's actual origin so that
+        // credentialed requests succeed.
+        let response = b"HTTP/1.1 200 OK\r\n\
+                        Content-Type: application/json\r\n\
+                        Access-Control-Allow-Origin: *\r\n\
+                        Access-Control-Allow-Methods: GET\r\n\
+                        Content-Length: 12\r\n\
+                        \r\n\
+                        {\"a\":\"b\"}xx";
+        let injected = inject_cors_response_headers(response, "https://www.youtube.com");
+        let s = std::str::from_utf8(&injected).unwrap();
+        // Original wildcard must be gone.
+        assert!(
+            !s.contains("Access-Control-Allow-Origin: *"),
+            "wildcard origin must be stripped, got: {}",
+            s
+        );
+        // Echoed origin + credentials must be present.
+        assert!(s.contains("Access-Control-Allow-Origin: https://www.youtube.com\r\n"));
+        assert!(s.contains("Access-Control-Allow-Credentials: true\r\n"));
+        // Body preserved byte-for-byte.
+        assert!(injected.ends_with(b"{\"a\":\"b\"}xx"));
+        // Status line preserved.
+        assert!(s.starts_with("HTTP/1.1 200 OK\r\n"));
+    }
+
+    #[test]
+    fn inject_cors_response_headers_preserves_non_acl_headers() {
+        // Non-ACL headers (Content-Type, Set-Cookie, Cache-Control, …)
+        // must pass through unchanged. Only `Access-Control-*` lines
+        // are stripped.
+        let response = b"HTTP/1.1 200 OK\r\n\
+                        Content-Type: text/html\r\n\
+                        Set-Cookie: a=1\r\n\
+                        Cache-Control: max-age=300\r\n\
+                        Access-Control-Allow-Origin: https://other.example\r\n\
+                        \r\n\
+                        body";
+        let injected = inject_cors_response_headers(response, "https://www.youtube.com");
+        let s = std::str::from_utf8(&injected).unwrap();
+        assert!(s.contains("Content-Type: text/html\r\n"));
+        assert!(s.contains("Set-Cookie: a=1\r\n"));
+        assert!(s.contains("Cache-Control: max-age=300\r\n"));
+        // Wrong origin replaced.
+        assert!(!s.contains("Access-Control-Allow-Origin: https://other.example\r\n"));
+        assert!(s.contains("Access-Control-Allow-Origin: https://www.youtube.com\r\n"));
+    }
+
+    #[test]
+    fn inject_cors_response_headers_returns_unchanged_when_no_header_terminator() {
+        // A response missing the `\r\n\r\n` separator (e.g. raw error
+        // blob, truncated upstream) must round-trip unchanged so we
+        // don't corrupt non-HTTP/1.x bytes.
+        let response = b"not an http response";
+        let injected = inject_cors_response_headers(response, "https://x.com");
+        assert_eq!(injected.as_slice(), response);
+    }
+
+    #[test]
     fn passthrough_hosts_ignores_empty_and_whitespace_entries() {
         let list = vec!["".to_string(), "   ".to_string(), "real.com".to_string()];
         assert!(!matches_passthrough("", &list));
@@ -2458,5 +3499,153 @@ mod tests {
         let list = vec!["example.com.".to_string()];
         assert!(matches_passthrough("example.com", &list));
         assert!(matches_passthrough("example.com.", &list));
+    }
+
+    #[test]
+    fn doh_default_list_exact_matches() {
+        let extra: Vec<String> = vec![];
+        assert!(matches_doh_host("chrome.cloudflare-dns.com", &extra));
+        assert!(matches_doh_host("dns.google", &extra));
+        assert!(matches_doh_host("dns.quad9.net", &extra));
+        assert!(matches_doh_host("doh.opendns.com", &extra));
+    }
+
+    #[test]
+    fn doh_default_list_case_insensitive_and_trailing_dot() {
+        let extra: Vec<String> = vec![];
+        assert!(matches_doh_host("DNS.GOOGLE", &extra));
+        assert!(matches_doh_host("dns.google.", &extra));
+    }
+
+    #[test]
+    fn doh_default_list_suffix_match_for_tenant_subdomains() {
+        // `cloudflare-dns.com` is in the default list — Workers-hosted
+        // tenant DoH endpoints sit under it and should match too.
+        let extra: Vec<String> = vec![];
+        assert!(matches_doh_host("tenant.cloudflare-dns.com", &extra));
+        // But a substring match must NOT pass: `xcloudflare-dns.com` is
+        // a different domain.
+        assert!(!matches_doh_host("xcloudflare-dns.com", &extra));
+    }
+
+    #[test]
+    fn doh_default_list_unrelated_hosts_do_not_match() {
+        let extra: Vec<String> = vec![];
+        assert!(!matches_doh_host("example.com", &extra));
+        assert!(!matches_doh_host("googlevideo.com", &extra));
+        assert!(!matches_doh_host("", &extra));
+    }
+
+    #[test]
+    fn doh_extra_list_extends_default() {
+        let extra = vec![".internal-doh.example".to_string(), "doh.acme.test".to_string()];
+        // Defaults still match.
+        assert!(matches_doh_host("dns.google", &extra));
+        // User additions match.
+        assert!(matches_doh_host("doh.acme.test", &extra));
+        assert!(matches_doh_host("a.b.internal-doh.example", &extra));
+        // Unrelated still doesn't match.
+        assert!(!matches_doh_host("example.com", &extra));
+    }
+
+    #[test]
+    fn doh_extra_entries_match_subdomains_without_leading_dot() {
+        // Asymmetry footgun guard: user adds `doh.acme.test` and expects
+        // `tenant.doh.acme.test` to match too — same as `dns.google`
+        // matching `tenant.dns.google` from the default list. Unlike
+        // `passthrough_hosts`, DoH extras don't require a leading dot.
+        let extra = vec!["doh.acme.test".to_string()];
+        assert!(matches_doh_host("doh.acme.test", &extra));
+        assert!(matches_doh_host("tenant.doh.acme.test", &extra));
+        // But substring overlap must still be rejected.
+        assert!(!matches_doh_host("xdoh.acme.test", &extra));
+    }
+
+    fn fg(name: &str, sni: &str, domains: &[&str]) -> Arc<FrontingGroupResolved> {
+        Arc::new(
+            FrontingGroupResolved::from_config(&FrontingGroup {
+                name: name.into(),
+                ip: "127.0.0.1".into(),
+                sni: sni.into(),
+                domains: domains.iter().map(|s| s.to_string()).collect(),
+            })
+            .expect("test fronting group should resolve"),
+        )
+    }
+
+    #[test]
+    fn fronting_group_match_exact_and_suffix() {
+        let groups = vec![fg("vercel", "react.dev", &["vercel.com", "nextjs.org"])];
+        // Exact.
+        assert_eq!(
+            match_fronting_group("vercel.com", &groups).map(|g| g.name.as_str()),
+            Some("vercel")
+        );
+        // Suffix.
+        assert_eq!(
+            match_fronting_group("app.vercel.com", &groups).map(|g| g.name.as_str()),
+            Some("vercel")
+        );
+        // Different member.
+        assert_eq!(
+            match_fronting_group("docs.nextjs.org", &groups).map(|g| g.name.as_str()),
+            Some("vercel")
+        );
+        // Non-member.
+        assert!(match_fronting_group("example.com", &groups).is_none());
+        // Substring overlap is NOT a match (xvercel.com isn't *.vercel.com).
+        assert!(match_fronting_group("xvercel.com", &groups).is_none());
+    }
+
+    #[test]
+    fn fronting_group_match_case_and_trailing_dot() {
+        let groups = vec![fg("fastly", "www.python.org", &["reddit.com"])];
+        assert_eq!(
+            match_fronting_group("Reddit.COM", &groups).map(|g| g.name.as_str()),
+            Some("fastly")
+        );
+        assert_eq!(
+            match_fronting_group("reddit.com.", &groups).map(|g| g.name.as_str()),
+            Some("fastly")
+        );
+        assert_eq!(
+            match_fronting_group("WWW.Reddit.com.", &groups).map(|g| g.name.as_str()),
+            Some("fastly")
+        );
+    }
+
+    #[test]
+    fn fronting_group_match_first_wins() {
+        // When a host is in two groups, the earlier group is chosen.
+        // Lets users put more-specific groups first.
+        let groups = vec![
+            fg("specific", "a.example", &["api.example.com"]),
+            fg("broad", "b.example", &["example.com"]),
+        ];
+        assert_eq!(
+            match_fronting_group("api.example.com", &groups).map(|g| g.name.as_str()),
+            Some("specific")
+        );
+        assert_eq!(
+            match_fronting_group("example.com", &groups).map(|g| g.name.as_str()),
+            Some("broad")
+        );
+    }
+
+    #[test]
+    fn fronting_group_match_empty_list() {
+        let groups: Vec<Arc<FrontingGroupResolved>> = Vec::new();
+        assert!(match_fronting_group("vercel.com", &groups).is_none());
+    }
+
+    #[test]
+    fn fronting_group_resolve_rejects_invalid_sni() {
+        let bad = FrontingGroup {
+            name: "bad".into(),
+            ip: "127.0.0.1".into(),
+            sni: "not a valid hostname".into(),
+            domains: vec!["x.com".into()],
+        };
+        assert!(FrontingGroupResolved::from_config(&bad).is_err());
     }
 }

@@ -1,5 +1,6 @@
 package com.therealaleph.mhrv.ui
 
+import android.widget.Toast
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.*
@@ -9,6 +10,7 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CheckCircle
@@ -23,7 +25,9 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
@@ -46,8 +50,10 @@ import com.therealaleph.mhrv.ui.theme.ErrRed
 import com.therealaleph.mhrv.ui.theme.OkGreen
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
 
 /**
@@ -69,9 +75,11 @@ sealed class CaInstallOutcome {
 /**
  * Top-level screen. Intentionally one scrollable page rather than tabs —
  * first-run users need to see everything (deployment IDs, cert button,
- * Start) on one surface. Anything that isn't first-run critical lives in
- * collapsible sections (SNI pool, Advanced, Logs) so the default view
- * stays short.
+ * Connect) on one surface. The Connect/Disconnect button sits right under
+ * the Mode dropdown so a long deployment-ID list can't push it off-screen
+ * for daily-use taps. Anything that isn't first-run critical (Apps Script
+ * setup once filled, SNI pool, Advanced, Logs) lives in collapsible
+ * sections so the default view stays short.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -122,18 +130,31 @@ fun HomeScreen(
         }
     }
 
-    // Cooldown on Start/Stop. Rapid taps during a VPN transition trigger
-    // an emulator-specific EGL renderer crash
-    // (F OpenGLRenderer: EGL_NOT_INITIALIZED during rendering) — the
-    // service survives, but the Compose UI process dies and the app
-    // appears to close. On real hardware this is rare, but debouncing
-    // is useful UX anyway: neither start nor stop is truly instant,
-    // and the user gets no feedback if they tap while one is in flight.
-    var transitionCooldown by remember { mutableStateOf(false) }
-    LaunchedEffect(transitionCooldown) {
-        if (transitionCooldown) {
-            delay(2000)
-            transitionCooldown = false
+    // Gate Start/Stop on the service's actual state transition rather
+    // than a fixed timer. The previous 2s cooldown was shorter than the
+    // worst-case teardown (Tun2proxy.stop + 4s join + 5s rt.shutdown_timeout
+    // ≈ 9s on the slowest path), which let the user fire a fresh Connect
+    // while the previous Stop's native cleanup was still releasing the
+    // listener port — the new startProxy then failed with "Address already
+    // in use".
+    //
+    // `awaitingRunning` holds the value we expect VpnState.isRunning to
+    // settle on after the user's action; null means "no transition in
+    // flight". The LaunchedEffect below suspends on the StateFlow until
+    // the predicate matches, with a 12s backstop in case the service
+    // failed before flipping the flag (e.g., establish() returned null).
+    // Side benefit: this also debounces the rapid-tap EGL renderer crash
+    // the old timer was guarding against.
+    var awaitingRunning by remember { mutableStateOf<Boolean?>(null) }
+    val transitioning = awaitingRunning != null
+    LaunchedEffect(awaitingRunning) {
+        val target = awaitingRunning ?: return@LaunchedEffect
+        try {
+            withTimeoutOrNull(12_000) {
+                VpnState.isRunning.first { it == target }
+            }
+        } finally {
+            awaitingRunning = null
         }
     }
 
@@ -229,34 +250,124 @@ fun HomeScreen(
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
+            // Config import/export bar — paste from clipboard + export + QR.
+            ConfigSharingBar(
+                cfg = cfg,
+                onImport = { persist(it) },
+                onSnackbar = { snackbar.showSnackbar(it) },
+            )
+
             SectionHeader("Mode")
             ModeDropdown(
                 mode = cfg.mode,
                 onChange = { persist(cfg.copy(mode = it)) },
             )
 
+            // Connect/Disconnect lives right under Mode so users with a long
+            // deployment-ID list don't have to scroll past it on every
+            // session. Disabled state still acts as the "you're not set up
+            // yet" signal — they'll expand the Apps Script section below to
+            // resolve it.
+            val isVpnRunning by VpnState.isRunning.collectAsState()
+            Button(
+                onClick = {
+                    if (isVpnRunning) {
+                        awaitingRunning = false
+                        onStop()
+                    } else {
+                        awaitingRunning = true
+                        // Connect flow: auto-resolve google_ip so we don't
+                        // hand the proxy a stale anycast target; repair
+                        // front_domain if it got corrupted into an IP
+                        // (SNI has to be a hostname); then fire onStart.
+                        // All three steps go through the Compose persist()
+                        // so a subsequent field edit can't overwrite the
+                        // fresh values with pre-resolve ones.
+                        scope.launch {
+                            // Only auto-fill google_ip if it's empty.
+                            // Issue #71: some Iranian ISPs return
+                            // poisoned A records for www.google.com that
+                            // resolve but then refuse TLS (or route to a
+                            // Google IP that's not on the GFE and can't
+                            // handle our SNI-rewrite). If the user has
+                            // manually set a working IP
+                            // (e.g. 216.239.38.120), we must NOT
+                            // overwrite it with a poisoned fresh lookup
+                            // just because the two values differ. They
+                            // can still force a re-resolve via the
+                            // explicit "Auto-detect" button above.
+                            var updated = cfg
+                            if (updated.googleIp.isBlank()) {
+                                val fresh = withContext(Dispatchers.IO) {
+                                    NetworkDetect.resolveGoogleIp()
+                                }
+                                if (!fresh.isNullOrBlank()) {
+                                    updated = updated.copy(googleIp = fresh)
+                                }
+                            }
+                            if (updated.frontDomain.isBlank() ||
+                                updated.frontDomain.parseAsIpOrNull() != null
+                            ) {
+                                updated = updated.copy(frontDomain = "www.google.com")
+                            }
+                            if (updated !== cfg) persist(updated)
+                            onStart()
+                        }
+                    }
+                },
+                enabled = (isVpnRunning ||
+                    cfg.mode == Mode.DIRECT ||
+                    (cfg.hasDeploymentId && cfg.authKey.isNotBlank())) && !transitioning,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = if (isVpnRunning) ErrRed else OkGreen,
+                    contentColor = androidx.compose.ui.graphics.Color.White,
+                    disabledContainerColor = MaterialTheme.colorScheme.surfaceVariant,
+                ),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 52.dp),
+            ) {
+                Text(
+                    when {
+                        transitioning -> "…"
+                        isVpnRunning -> stringResource(R.string.btn_disconnect)
+                        else -> stringResource(R.string.btn_connect)
+                    },
+                    style = MaterialTheme.typography.titleMedium,
+                )
+            }
+
             Spacer(Modifier.height(4.dp))
-            SectionHeader(stringResource(R.string.sec_apps_script_relay))
 
             val appsScriptEnabled = cfg.mode == Mode.APPS_SCRIPT || cfg.mode == Mode.FULL
-            DeploymentIdsField(
-                urls = cfg.appsScriptUrls,
-                onChange = { persist(cfg.copy(appsScriptUrls = it)) },
-                enabled = appsScriptEnabled,
-            )
+            // Wrapped in a collapsible so a long ID list (10+ deployments
+            // is normal in full-tunnel rotations) doesn't dominate the
+            // screen once it's set up. Starts expanded for first-run users
+            // (no IDs/key yet) so the form is immediately discoverable.
+            CollapsibleSection(
+                title = stringResource(R.string.sec_apps_script_relay),
+                initiallyExpanded = appsScriptEnabled &&
+                    (cfg.appsScriptUrls.isEmpty() || cfg.authKey.isBlank()),
+            ) {
+                DeploymentIdsField(
+                    urls = cfg.appsScriptUrls,
+                    onChange = { persist(cfg.copy(appsScriptUrls = it)) },
+                    enabled = appsScriptEnabled,
+                )
 
-            OutlinedTextField(
-                value = cfg.authKey,
-                onValueChange = { persist(cfg.copy(authKey = it)) },
-                label = { Text(stringResource(R.string.field_auth_key)) },
-                singleLine = true,
-                enabled = appsScriptEnabled,
-                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next),
-                modifier = Modifier.fillMaxWidth(),
-                supportingText = {
-                    Text(stringResource(R.string.help_auth_key))
-                },
-            )
+                OutlinedTextField(
+                    value = cfg.authKey,
+                    onValueChange = { persist(cfg.copy(authKey = it)) },
+                    label = { Text(stringResource(R.string.field_auth_key)) },
+                    singleLine = true,
+                    enabled = appsScriptEnabled,
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next),
+                    modifier = Modifier.fillMaxWidth(),
+                    supportingText = {
+                        Text(stringResource(R.string.help_auth_key))
+                    },
+                )
+            }
 
             Spacer(Modifier.height(4.dp))
             SectionHeader(stringResource(R.string.sec_network))
@@ -360,89 +471,10 @@ fun HomeScreen(
             }
 
             Spacer(Modifier.height(8.dp))
-
-            // Unified Connect/Disconnect button. Color + label track the
-            // service's real "is it running right now" state (via
-            // `VpnState.isRunning`), so the UI never shows "Connect" while
-            // the tunnel is still up or "Disconnect" after the service
-            // finished tearing down. Two tap paths, one button:
-            //   - running=false → green "Connect" → runs the auto-resolve
-            //     + persist + onStart() sequence we used to hang off the
-            //     old Start button.
-            //   - running=true  → red "Disconnect" → fires onStop().
-            val isVpnRunning by VpnState.isRunning.collectAsState()
-            Button(
-                onClick = {
-                    transitionCooldown = true
-                    if (isVpnRunning) {
-                        onStop()
-                    } else {
-                        // Connect flow: auto-resolve google_ip so we don't
-                        // hand the proxy a stale anycast target; repair
-                        // front_domain if it got corrupted into an IP
-                        // (SNI has to be a hostname); then fire onStart.
-                        // All three steps go through the Compose persist()
-                        // so a subsequent field edit can't overwrite the
-                        // fresh values with pre-resolve ones.
-                        scope.launch {
-                            // Only auto-fill google_ip if it's empty.
-                            // Issue #71: some Iranian ISPs return
-                            // poisoned A records for www.google.com that
-                            // resolve but then refuse TLS (or route to a
-                            // Google IP that's not on the GFE and can't
-                            // handle our SNI-rewrite). If the user has
-                            // manually set a working IP
-                            // (e.g. 216.239.38.120), we must NOT
-                            // overwrite it with a poisoned fresh lookup
-                            // just because the two values differ. They
-                            // can still force a re-resolve via the
-                            // explicit "Auto-detect" button above.
-                            var updated = cfg
-                            if (updated.googleIp.isBlank()) {
-                                val fresh = withContext(Dispatchers.IO) {
-                                    NetworkDetect.resolveGoogleIp()
-                                }
-                                if (!fresh.isNullOrBlank()) {
-                                    updated = updated.copy(googleIp = fresh)
-                                }
-                            }
-                            if (updated.frontDomain.isBlank() ||
-                                updated.frontDomain.parseAsIpOrNull() != null
-                            ) {
-                                updated = updated.copy(frontDomain = "www.google.com")
-                            }
-                            if (updated !== cfg) persist(updated)
-                            onStart()
-                        }
-                    }
-                },
-                enabled = (isVpnRunning ||
-                    cfg.mode == Mode.GOOGLE_ONLY ||
-                    (cfg.hasDeploymentId && cfg.authKey.isNotBlank())) && !transitionCooldown,
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = if (isVpnRunning) ErrRed else OkGreen,
-                    contentColor = androidx.compose.ui.graphics.Color.White,
-                    disabledContainerColor = MaterialTheme.colorScheme.surfaceVariant,
-                ),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(min = 52.dp),
-            ) {
-                Text(
-                    when {
-                        transitionCooldown -> "…"
-                        isVpnRunning -> stringResource(R.string.btn_disconnect)
-                        else -> stringResource(R.string.btn_connect)
-                    },
-                    style = MaterialTheme.typography.titleMedium,
-                )
-            }
-
-            Spacer(Modifier.height(4.dp))
-            // Secondary accent button — FilledTonalButton reads as a lower-
-            // priority action next to Start/Stop, matching the desktop UI's
-            // visual hierarchy where Install CA is offered as a helper
-            // button rather than the headline action.
+            // Secondary action — FilledTonalButton signals "helper" against
+            // the primary Connect/Disconnect button at the top. Kept down
+            // here because cert install is a one-time setup step; daily
+            // users never tap it again.
             FilledTonalButton(
                 onClick = { showInstallDialog = true },
                 modifier = Modifier.fillMaxWidth(),
@@ -459,6 +491,7 @@ fun HomeScreen(
             // client-side estimate only sees what this device relayed,
             // not what other devices on the same deployment consumed.
             UsageTodayCard()
+            PipelineDebugCard()
 
             CollapsibleSection(title = stringResource(R.string.sec_live_logs), initiallyExpanded = false) {
                 LiveLogPane()
@@ -698,8 +731,14 @@ private fun ConnectionModeDropdown(
 }
 
 // =========================================================================
-// Deployment IDs editor — one row per ID, with add/remove buttons.
+// Deployment IDs editor — one row per ID, with add/remove buttons. The
+// "+ Add" field accepts a single ID OR a bulk paste of many separated by
+// whitespace / newline / comma / semicolon — useful when migrating from
+// the desktop config or pasting a freshly-deployed batch (issue: bulk add).
 // =========================================================================
+
+/** Split a bulk-pasted blob into individual entries. */
+private val ID_SEPARATORS = Regex("[\\s,;]+")
 
 @Composable
 private fun DeploymentIdsField(
@@ -716,6 +755,8 @@ private fun DeploymentIdsField(
         )
 
         // Existing entries — each with its own row and a remove button.
+        // A bulk paste into an existing row also expands into multiple
+        // entries, so users don't have to find the "+ Add" field to do it.
         urls.forEachIndexed { index, url ->
             Row(
                 verticalAlignment = Alignment.CenterVertically,
@@ -724,8 +765,18 @@ private fun DeploymentIdsField(
                 OutlinedTextField(
                     value = url,
                     onValueChange = { edited ->
+                        val parts = edited.split(ID_SEPARATORS).filter { it.isNotBlank() }
                         val updated = urls.toMutableList()
-                        updated[index] = edited
+                        if (parts.size > 1) {
+                            // Bulk paste into this row: expand in place.
+                            updated.removeAt(index)
+                            updated.addAll(index, parts)
+                        } else {
+                            // Normal typing — preserve raw input so the
+                            // caret/whitespace doesn't get reformatted on
+                            // every keystroke.
+                            updated[index] = edited
+                        }
                         onChange(updated)
                     },
                     enabled = enabled,
@@ -745,9 +796,11 @@ private fun DeploymentIdsField(
             }
         }
 
-        // "Add" row: text field + button.
+        // "Add" row: multi-line text field + button. Multi-line so a user
+        // can paste a long list at once (newline-separated is the natural
+        // form when copying out of the desktop UI's textarea).
         Row(
-            verticalAlignment = Alignment.CenterVertically,
+            verticalAlignment = Alignment.Top,
             modifier = Modifier.fillMaxWidth(),
         ) {
             OutlinedTextField(
@@ -755,15 +808,17 @@ private fun DeploymentIdsField(
                 onValueChange = { newEntry = it },
                 enabled = enabled,
                 modifier = Modifier.weight(1f),
-                singleLine = true,
-                placeholder = { Text("Paste URL or ID") },
+                singleLine = false,
+                minLines = 1,
+                maxLines = 6,
+                placeholder = { Text(stringResource(R.string.placeholder_paste_ids)) },
             )
             Spacer(Modifier.width(8.dp))
             Button(
                 onClick = {
-                    val trimmed = newEntry.trim()
-                    if (trimmed.isNotBlank()) {
-                        onChange(urls + trimmed)
+                    val parts = newEntry.split(ID_SEPARATORS).filter { it.isNotBlank() }
+                    if (parts.isNotEmpty()) {
+                        onChange(urls + parts)
                         newEntry = ""
                     }
                 },
@@ -783,7 +838,7 @@ private fun DeploymentIdsField(
 }
 
 // =========================================================================
-// Mode dropdown: apps_script (default) vs google_only (bootstrap).
+// Mode dropdown: apps_script (default), direct (no relay), or full.
 // =========================================================================
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -793,11 +848,11 @@ private fun ModeDropdown(
     onChange: (Mode) -> Unit,
 ) {
     val labelApps = "Apps Script (MITM)"
-    val labelGoogle = "Google-only (bootstrap)"
+    val labelDirect = "Direct (no relay)"
     val labelFull = "Full tunnel (no cert)"
     val currentLabel = when (mode) {
         Mode.APPS_SCRIPT -> labelApps
-        Mode.GOOGLE_ONLY -> labelGoogle
+        Mode.DIRECT -> labelDirect
         Mode.FULL -> labelFull
     }
     var expanded by remember { mutableStateOf(false) }
@@ -824,8 +879,8 @@ private fun ModeDropdown(
                     onClick = { onChange(Mode.APPS_SCRIPT); expanded = false },
                 )
                 DropdownMenuItem(
-                    text = { Text(labelGoogle) },
-                    onClick = { onChange(Mode.GOOGLE_ONLY); expanded = false },
+                    text = { Text(labelDirect) },
+                    onClick = { onChange(Mode.DIRECT); expanded = false },
                 )
                 DropdownMenuItem(
                     text = { Text(labelFull) },
@@ -837,8 +892,8 @@ private fun ModeDropdown(
         val help = when (mode) {
             Mode.APPS_SCRIPT ->
                 "Full DPI bypass through your deployed Apps Script relay."
-            Mode.GOOGLE_ONLY ->
-                "Bootstrap: reach *.google.com directly so you can open script.google.com and deploy Code.gs. Non-Google traffic goes direct."
+            Mode.DIRECT ->
+                "SNI-rewrite tunnel only — no relay. Reach *.google.com (and any configured fronting_groups) directly. Useful as a bootstrap to open script.google.com and deploy Code.gs."
             Mode.FULL ->
                 "All traffic tunneled end-to-end through Apps Script + remote tunnel node. No certificate needed."
         }
@@ -1142,6 +1197,25 @@ private fun AdvancedSettings(
             )
         }
 
+        // youtube_via_relay
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(stringResource(R.string.adv_youtube_via_relay), style = MaterialTheme.typography.bodyMedium)
+                Text(
+                    stringResource(R.string.adv_youtube_via_relay_help),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Switch(
+                checked = cfg.youtubeViaRelay,
+                onCheckedChange = { onChange(cfg.copy(youtubeViaRelay = it)) },
+            )
+        }
+
         // log_level dropdown
         var expanded by remember { mutableStateOf(false) }
         val levels = listOf("trace", "debug", "info", "warn", "error", "off")
@@ -1192,6 +1266,121 @@ private fun AdvancedSettings(
             )
         }
 
+        // Block QUIC toggle
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    "Block QUIC",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                Text(
+                    "Drop UDP/443 so browsers use TCP/HTTPS. QUIC over TCP tunnel causes meltdown.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Switch(
+                checked = cfg.blockQuic,
+                onCheckedChange = { onChange(cfg.copy(blockQuic = it)) },
+            )
+        }
+
+        // Block STUN/TURN toggle
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    "Block STUN/TURN",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                Text(
+                    "Reject STUN/TURN ports (3478/5349/19302). Forces WebRTC apps (Meet, WhatsApp) to TCP fallback — instant connect.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Switch(
+                checked = cfg.blockStun,
+                onCheckedChange = { onChange(cfg.copy(blockStun = it)) },
+            )
+        }
+
+        // Block DoH toggle
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    "Block DoH",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                Text(
+                    "Reject browser DoH — forces instant system DNS via tun2proxy. Saves ~1.5s per domain lookup.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Switch(
+                checked = cfg.blockDoh,
+                onCheckedChange = { onChange(cfg.copy(blockDoh = it)) },
+            )
+        }
+
+        // Bypass DoH toggle
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    "Bypass DoH",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                Text(
+                    "Send browser DoH direct, not through tunnel. Faster DNS — queries are still encrypted.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Switch(
+                checked = !cfg.tunnelDoh,
+                onCheckedChange = { onChange(cfg.copy(tunnelDoh = !it)) },
+                enabled = !cfg.blockDoh,
+            )
+        }
+
+        // Batch coalesce step slider
+        Column {
+            Text(
+                "Coalesce step: ${cfg.coalesceStepMs}ms",
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            Slider(
+                value = cfg.coalesceStepMs.toFloat(),
+                onValueChange = { onChange(cfg.copy(coalesceStepMs = it.toInt().coerceIn(10, 500))) },
+                valueRange = 10f..500f,
+            )
+        }
+
+        // Batch coalesce max slider
+        Column {
+            Text(
+                "Coalesce max: ${cfg.coalesceMaxMs}ms",
+                style = MaterialTheme.typography.bodyMedium,
+            )
+            Slider(
+                value = cfg.coalesceMaxMs.toFloat(),
+                onValueChange = { onChange(cfg.copy(coalesceMaxMs = it.toInt().coerceIn(100, 2000))) },
+                valueRange = 100f..2000f,
+            )
+        }
+
         OutlinedTextField(
             value = cfg.upstreamSocks5,
             onValueChange = { onChange(cfg.copy(upstreamSocks5 = it)) },
@@ -1215,6 +1404,8 @@ private fun LiveLogPane() {
     val lines = remember { mutableStateListOf<String>() }
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
+    val clipboard = LocalClipboardManager.current
+    val ctx = LocalContext.current
 
     // Pull from the ring buffer periodically. We pull even while the
     // section is collapsed (cheap), so re-expanding shows fresh tail.
@@ -1244,24 +1435,41 @@ private fun LiveLogPane() {
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.weight(1f),
             )
-            TextButton(onClick = { lines.clear() }) { Text("Clear") }
+            TextButton(
+                enabled = lines.isNotEmpty(),
+                onClick = {
+                    clipboard.setText(AnnotatedString(lines.joinToString("\n")))
+                    Toast.makeText(
+                        ctx,
+                        ctx.getString(R.string.snack_logs_copied),
+                        Toast.LENGTH_SHORT,
+                    ).show()
+                },
+            ) { Text(stringResource(R.string.btn_copy)) }
+            TextButton(onClick = { lines.clear() }) { Text(stringResource(R.string.btn_clear)) }
         }
         Surface(
             color = MaterialTheme.colorScheme.surfaceVariant,
             shape = RoundedCornerShape(8.dp),
             modifier = Modifier.fillMaxWidth().heightIn(min = 160.dp, max = 320.dp),
         ) {
-            LazyColumn(
-                state = listState,
-                modifier = Modifier.padding(8.dp),
-            ) {
-                items(lines) { line ->
-                    Text(
-                        line,
-                        style = MaterialTheme.typography.bodySmall,
-                        fontFamily = FontFamily.Monospace,
-                        fontSize = 11.sp,
-                    )
+            // SelectionContainer makes log lines selectable for manual
+            // copy of partial ranges. Cross-line selection works within the
+            // currently rendered window; for "copy everything" the Copy
+            // button above is the reliable path.
+            SelectionContainer {
+                LazyColumn(
+                    state = listState,
+                    modifier = Modifier.padding(8.dp),
+                ) {
+                    items(lines) { line ->
+                        Text(
+                            line,
+                            style = MaterialTheme.typography.bodySmall,
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 11.sp,
+                        )
+                    }
                 }
             }
         }
@@ -1324,14 +1532,17 @@ private fun CollapsibleSection(
 /**
  * "Usage today (estimated)" card. Polls `Native.statsJson(handle)` every
  * second while the proxy is up and renders today's relay calls vs. the
- * Apps Script free-tier quota (20,000/day), today's bytes, UTC day key,
- * and a countdown to the 00:00 UTC reset. Also shows a "View quota on
- * Google" button that opens Google's Apps Script dashboard — the
- * authoritative number, since the client-side estimate only sees what
- * this device relayed.
+ * Apps Script free-tier quota (20,000/day), today's bytes, the Pacific
+ * Time day key, and a countdown to the 00:00 PT reset. Pacific Time
+ * matches Apps Script's actual quota reset cadence — UTC would have
+ * the counter resetting ~7-8 h before the user actually got a fresh
+ * quota allotment from Google. Also shows a "View quota on Google"
+ * button that opens Google's Apps Script dashboard — the authoritative
+ * number, since the client-side estimate only sees what this device
+ * relayed.
  *
  * Hidden when the handle is 0 (proxy not running) or the JSON comes back
- * empty (google_only / full-only configs don't run a DomainFronter and so
+ * empty (direct / full-only configs don't run a DomainFronter and so
  * have nothing to report).
  */
 @Composable
@@ -1400,7 +1611,7 @@ private fun UsageTodayCard() {
                 value = fmtBytes(todayBytes),
             )
             UsageRow(
-                label = stringResource(R.string.label_utc_day),
+                label = stringResource(R.string.label_pt_day),
                 value = todayKey,
             )
             UsageRow(
@@ -1454,6 +1665,104 @@ private fun UsageRow(label: String, value: String) {
             style = MaterialTheme.typography.bodyMedium,
             fontFamily = FontFamily.Monospace,
         )
+    }
+}
+
+@Composable
+private fun PipelineDebugCard() {
+    val isRunning by VpnState.isRunning.collectAsState()
+    if (!isRunning) return
+
+    var json by remember { mutableStateOf("") }
+    LaunchedEffect(isRunning) {
+        if (!isRunning) return@LaunchedEffect
+        while (true) {
+            val result = withContext(Dispatchers.IO) {
+                runCatching { Native.pipelineDebugJson() }
+            }
+            json = result.getOrDefault("")
+            if (result.isFailure) {
+                android.util.Log.e("PipeDbg", "pipelineDebugJson failed", result.exceptionOrNull())
+            }
+            delay(500)
+        }
+    }
+
+    val obj = remember(json) {
+        if (json.isBlank()) null
+        else runCatching { JSONObject(json) }.getOrNull()
+    }
+    if (obj == null) return
+
+    val elevated = obj.optInt("elevated", 0)
+    val maxElevated = obj.optInt("max_elevated", 0)
+    val batches = obj.optInt("active_batches", 0)
+    val maxBatches = obj.optInt("max_batch_slots", 0)
+    val events = remember(json) {
+        val arr = obj.optJSONArray("events") ?: return@remember emptyList<String>()
+        (0 until arr.length()).map { arr.getString(it) }
+    }
+
+    Spacer(Modifier.height(8.dp))
+    ElevatedCard(modifier = Modifier.fillMaxWidth()) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            Text(
+                "Pipeline Debug",
+                style = MaterialTheme.typography.titleSmall,
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Text("Elevated", style = MaterialTheme.typography.bodySmall)
+                Text(
+                    "$elevated / $maxElevated",
+                    style = MaterialTheme.typography.bodySmall,
+                    fontFamily = FontFamily.Monospace,
+                )
+            }
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
+                Text("Batches in-flight", style = MaterialTheme.typography.bodySmall)
+                Text(
+                    "$batches / $maxBatches",
+                    style = MaterialTheme.typography.bodySmall,
+                    fontFamily = FontFamily.Monospace,
+                )
+            }
+            if (events.isNotEmpty()) {
+                Spacer(Modifier.height(4.dp))
+                Text("Events", style = MaterialTheme.typography.labelSmall)
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 150.dp)
+                        .clip(RoundedCornerShape(4.dp))
+                        .background(MaterialTheme.colorScheme.surfaceVariant)
+                        .padding(6.dp)
+                ) {
+                    val listState = rememberLazyListState()
+                    LaunchedEffect(events.size) {
+                        if (events.isNotEmpty()) listState.animateScrollToItem(events.size - 1)
+                    }
+                    LazyColumn(state = listState) {
+                        items(events) { ev ->
+                            Text(
+                                ev,
+                                style = MaterialTheme.typography.bodySmall,
+                                fontFamily = FontFamily.Monospace,
+                                fontSize = 10.sp,
+                            )
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

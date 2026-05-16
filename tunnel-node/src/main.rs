@@ -22,11 +22,13 @@ use axum::{routing::post, Json, Router};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::{lookup_host, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::task::JoinSet;
+
+mod udpgw;
 
 /// Structured error code returned when the tunnel-node receives an op it
 /// doesn't recognize. Clients use this (rather than string-matching `e`) to
@@ -40,16 +42,13 @@ const CODE_UNSUPPORTED_OP: &str = "UNSUPPORTED_OP";
 /// milliseconds — once any session in the batch fires its notify.
 const ACTIVE_DRAIN_DEADLINE: Duration = Duration::from_millis(350);
 
-/// After the first session in an active batch wakes the wait, we sleep
-/// briefly so neighboring sessions whose responses land just after the
-/// first one don't get reported empty and pay an extra round-trip. Only
-/// applies to active batches — for long-poll batches the wake event IS
-/// the data we want, so we deliver it immediately.
-///
-/// 30 ms is much shorter than the legacy two-pass retry (150 + 200 ms)
-/// but covers the typical case of co-located upstreams whose RTTs
-/// cluster within a few tens of ms of each other.
-const STRAGGLER_SETTLE: Duration = Duration::from_millis(30);
+/// Adaptive straggler settle: after the first session in an active batch
+/// wakes the drain, keep checking in STEP increments whether new data is
+/// still arriving. Stops when no new data arrived in the last STEP (the
+/// burst is over) or MAX is reached. Packing more session responses into
+/// one batch saves quota on high-latency relays (~1.5s Apps Script overhead).
+const STRAGGLER_SETTLE_STEP: Duration = Duration::from_millis(10);
+const STRAGGLER_SETTLE_MAX: Duration = Duration::from_millis(1000);
 
 /// Drain-phase deadline when the batch is a pure poll (no writes, no new
 /// connections — clients just asking "any push data?"). Holding the
@@ -63,18 +62,16 @@ const STRAGGLER_SETTLE: Duration = Duration::from_millis(30);
 /// op per session), so any local bytes that arrive while the poll is
 /// being held are stuck in the kernel until the poll returns.
 ///
-///   * Lower (e.g. 2 s) — interactive shells / typing-burst flows feel
-///     snappier, but push-only sessions pay more empty round-trips.
-///   * Higher (e.g. 20 s) — push delivery is near-RTT and round-trip
-///     count is minimal, but a thinking pause between keystrokes can
-///     tax the next keystroke by up to the chosen value.
-///
-/// 5 s is a middle ground: a typing user pausing mid-thought pays at
-/// most a 5 s nudge before their next keystroke flows, while idle
-/// sessions still get the bulk of the long-poll benefit. Must also
-/// stay safely below the client's `BATCH_TIMEOUT` (30 s) and Apps
-/// Script's UrlFetch ceiling (~60 s).
-const LONGPOLL_DEADLINE: Duration = Duration::from_secs(5);
+/// 15 s keeps persistent connections (Telegram XMPP on :5222, Google
+/// Push on :5228) alive without forcing frequent reconnects. At 5 s,
+/// apps like Telegram interpreted the frequent empty returns as
+/// connection instability and rotated sessions — each reconnect costs
+/// a full TLS handshake (~4 s through Apps Script), causing visible
+/// video/voice interruptions. 15 s is well below the client's
+/// `BATCH_TIMEOUT` (30 s) and Apps Script's UrlFetch ceiling (~60 s).
+/// Tested on censored networks in Iran where users reported smoother
+/// Telegram video playback and fewer session resets at this value.
+const LONGPOLL_DEADLINE: Duration = Duration::from_secs(4);
 
 /// Bound on each UDP session's inbound queue. Beyond this we drop oldest
 /// to keep recent voice/media packets moving — a stale RTP frame is
@@ -86,6 +83,35 @@ const UDP_QUEUE_LIMIT: usize = 256;
 /// a maximum-size IPv4 datagram without truncation.
 const UDP_RECV_BUF_BYTES: usize = 65536;
 
+/// Maximum raw bytes per TCP drain that we hand back to Apps Script in
+/// one batch response. Apps Script's hard cap on Web App response body
+/// is ~50 MiB. Accounting for base64 encoding (1.33×) and JSON envelope
+/// overhead, the safe ceiling for raw bytes is roughly 32 MiB — but
+/// `serde_json::to_vec` for a single 32-MiB string is also a CPU spike,
+/// so we lean further back at 16 MiB. On a high-bandwidth VPS (1 Gbps+)
+/// the reader task can stuff the per-session buffer with tens of MiB
+/// between polls (issue #460); without this cap, `drain_now` would take
+/// the lot, the response would exceed Apps Script's ceiling, the body
+/// would be truncated mid-base64, and the client would fail JSON parse
+/// with `EOF while parsing a string at line 1 column ~52428685`. By
+/// returning at most this many bytes per drain and leaving the rest in
+/// the read buffer for the next poll, we keep responses comfortably
+/// under the cap and let throughput recover across batches.
+const TCP_DRAIN_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+/// Hard cap on the total raw bytes drained across **all sessions** in a
+/// single batch response. The per-session cap (`TCP_DRAIN_MAX_BYTES`)
+/// alone isn't enough — N concurrent sessions can each contribute up to
+/// 16 MiB raw; with N≥4, the summed batch body exceeds Apps Script's
+/// 50 MiB ceiling and the client fails JSON parse mid-stream (#863).
+///
+/// 32 MiB raw → ~43 MiB base64 + per-session JSON envelope overhead
+/// (~80 bytes × ≤50 ops cap) → comfortably under 50 MiB total. Any
+/// further sessions in the same batch are deferred to the next poll
+/// (their data stays in their per-session `read_buf`, so no data loss
+/// — they just settle one batch later).
+const BATCH_RESPONSE_BUDGET: usize = 32 * 1024 * 1024;
+
 /// First queue-drop on a session always logs at warn level; subsequent
 /// drops log at debug only every Nth occurrence so a single congested
 /// session can't flood the operator's log.
@@ -95,8 +121,30 @@ const UDP_QUEUE_DROP_LOG_STRIDE: u64 = 100;
 // Session
 // ---------------------------------------------------------------------------
 
+/// Writer half — either a real TCP socket or an in-process duplex channel
+/// (used for virtual sessions like udpgw).
+enum SessionWriter {
+    Tcp(OwnedWriteHalf),
+    Duplex(tokio::io::WriteHalf<tokio::io::DuplexStream>),
+}
+
+impl SessionWriter {
+    async fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        match self {
+            SessionWriter::Tcp(w) => w.write_all(buf).await,
+            SessionWriter::Duplex(w) => w.write_all(buf).await,
+        }
+    }
+    async fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            SessionWriter::Tcp(w) => w.flush().await,
+            SessionWriter::Duplex(w) => w.flush().await,
+        }
+    }
+}
+
 struct SessionInner {
-    writer: Mutex<OwnedWriteHalf>,
+    writer: Mutex<SessionWriter>,
     read_buf: Mutex<Vec<u8>>,
     eof: AtomicBool,
     last_active: Mutex<Instant>,
@@ -105,11 +153,27 @@ struct SessionInner {
     /// to wake the drain phase as soon as any session has something to
     /// ship, replacing the old fixed-sleep heuristic.
     notify: Notify,
+    /// Sequence-ordered write buffer: pipelined data ops may arrive
+    /// out of order (different batches completing at different times).
+    /// We buffer out-of-order writes and flush in seq order.
+    next_write_seq: Mutex<Option<u64>>,
+    pending_writes: Mutex<std::collections::BTreeMap<u64, Vec<u8>>>,
 }
 
 struct ManagedSession {
     inner: Arc<SessionInner>,
     reader_handle: tokio::task::JoinHandle<()>,
+    /// For udpgw sessions, the server task handle (so we can abort on close).
+    udpgw_handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl ManagedSession {
+    fn abort_all(&self) {
+        self.reader_handle.abort();
+        if let Some(ref h) = self.udpgw_handle {
+            h.abort();
+        }
+    }
 }
 
 /// UDP equivalent of `SessionInner`. Holds a *connected* `UdpSocket`
@@ -148,21 +212,45 @@ async fn create_session(host: &str, port: u16) -> std::io::Result<ManagedSession
     let (reader, writer) = stream.into_split();
 
     let inner = Arc::new(SessionInner {
-        writer: Mutex::new(writer),
+        writer: Mutex::new(SessionWriter::Tcp(writer)),
         read_buf: Mutex::new(Vec::with_capacity(32768)),
         eof: AtomicBool::new(false),
         last_active: Mutex::new(Instant::now()),
         notify: Notify::new(),
+        next_write_seq: Mutex::new(None),
+        pending_writes: Mutex::new(std::collections::BTreeMap::new()),
     });
 
     let inner_ref = inner.clone();
     let reader_handle = tokio::spawn(reader_task(reader, inner_ref));
 
-    Ok(ManagedSession { inner, reader_handle })
+    Ok(ManagedSession { inner, reader_handle, udpgw_handle: None })
 }
 
-async fn reader_task(mut reader: OwnedReadHalf, session: Arc<SessionInner>) {
-    let mut buf = vec![0u8; 65536];
+/// Create a virtual udpgw session backed by an in-process duplex channel.
+fn create_udpgw_session() -> ManagedSession {
+    let (client_half, server_half) = tokio::io::duplex(65536);
+    let (read_half, write_half) = tokio::io::split(client_half);
+
+    let inner = Arc::new(SessionInner {
+        writer: Mutex::new(SessionWriter::Duplex(write_half)),
+        read_buf: Mutex::new(Vec::with_capacity(32768)),
+        eof: AtomicBool::new(false),
+        last_active: Mutex::new(Instant::now()),
+        notify: Notify::new(),
+        next_write_seq: Mutex::new(None),
+        pending_writes: Mutex::new(std::collections::BTreeMap::new()),
+    });
+
+    let inner_ref = inner.clone();
+    let reader_handle = tokio::spawn(reader_task(read_half, inner_ref));
+    let udpgw_handle = Some(tokio::spawn(udpgw::udpgw_server_task(server_half)));
+
+    ManagedSession { inner, reader_handle, udpgw_handle }
+}
+
+async fn reader_task(mut reader: impl AsyncRead + Unpin, session: Arc<SessionInner>) {
+    let mut buf = vec![0u8; 2 * 1024 * 1024];
     loop {
         match reader.read(&mut buf).await {
             Ok(0) => {
@@ -274,13 +362,38 @@ async fn udp_reader_task(socket: Arc<UdpSocket>, session: Arc<UdpSessionInner>) 
     }
 }
 
-/// Drain whatever is currently buffered — no waiting.
-/// Used by batch mode where we poll frequently.
-async fn drain_now(session: &SessionInner) -> (Vec<u8>, bool) {
+/// Drain up to `min(TCP_DRAIN_MAX_BYTES, max_bytes)` from the per-session
+/// read buffer — no waiting. Used by batch mode where we poll frequently.
+///
+/// `max_bytes` is the caller-supplied budget for this drain (typically the
+/// remaining batch-response budget after summing previous drains in the
+/// same batch). It allows the batch loop to stop one session short of
+/// blowing past Apps Script's 50 MiB ceiling on the wire (#863). Pass
+/// `usize::MAX` if there's no extra budget constraint (e.g. single-op
+/// path outside the batch loop).
+///
+/// If the buffer is larger than the effective cap, we return a prefix of
+/// the data and leave the remainder in the buffer for the next poll.
+///
+/// `eof` is reported as true only when the buffer has been fully drained
+/// AND upstream has signaled EOF — otherwise a partial drain would
+/// prematurely tear the session down on the client side.
+async fn drain_now(session: &SessionInner, max_bytes: usize) -> (Vec<u8>, bool) {
     let mut buf = session.read_buf.lock().await;
-    let data = std::mem::take(&mut *buf);
-    let eof = session.eof.load(Ordering::Acquire);
-    (data, eof)
+    let raw_eof = session.eof.load(Ordering::Acquire);
+    let cap = max_bytes.min(TCP_DRAIN_MAX_BYTES);
+    if buf.len() <= cap {
+        let data = std::mem::take(&mut *buf);
+        (data, raw_eof)
+    } else {
+        // Take the prefix; leave the tail in the buffer.
+        let tail = buf.split_off(cap);
+        let head = std::mem::replace(&mut *buf, tail);
+        // Don't propagate eof yet — buffer still has data even if upstream
+        // has closed. The client will get eof on the drain that returns
+        // an empty (or sub-cap) buffer.
+        (head, false)
+    }
 }
 
 /// Block until *any* of `inners` has buffered data, hits EOF, or the
@@ -307,6 +420,27 @@ async fn drain_now(session: &SessionInner) -> (Vec<u8>, bool) {
 ///     wait for a real notify. Without this filter, an idle long-poll
 ///     batch could return in <1 ms on a stale permit and degrade push
 ///     delivery to the client's idle re-poll cadence.
+/// `JoinHandle` newtype that aborts the task on `Drop`. Lets the waiter
+/// helpers below be cancel-safe under `tokio::select!`: a plain
+/// `Vec<JoinHandle<()>>` only releases its handles via `Drop`, which
+/// *detaches* tasks rather than aborting them. The previous shape
+/// relied on a trailing `for w in &watchers { w.abort(); }` loop —
+/// fine when the function ran to completion, but past the cancellation
+/// points (`is_any_drainable().await`, the inner `select!`), so
+/// cancelling the loser arm of the phase-2 `select!` left N orphan
+/// watchers parked on `notify.notified()`. Each held an
+/// `Arc<…Inner>` and could steal a `notify_one()` permit from a
+/// future batch's watcher, making that batch wait until the next
+/// notify or its deadline. Wrapping in `AbortOnDrop` makes cleanup
+/// happen on every exit path, including cancellation.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 async fn wait_for_any_drainable(inners: &[Arc<SessionInner>], deadline: Duration) {
     if inners.is_empty() {
         return;
@@ -314,15 +448,15 @@ async fn wait_for_any_drainable(inners: &[Arc<SessionInner>], deadline: Duration
 
     // One watcher per session. Each loops until it observes real state
     // (eof set or buffer non-empty) before signaling — see the
-    // race-safety note on `wait_for_any_drainable` for why. We abort the
-    // watchers on return; the only state they hold is a notify
-    // subscription, so abort is clean.
+    // race-safety note above. Watchers are held in a Vec of
+    // `AbortOnDrop`, so they're aborted on every exit path —
+    // including cancellation by an outer `select!`.
     let (tx, mut rx) = mpsc::channel::<()>(1);
-    let mut watchers = Vec::with_capacity(inners.len());
+    let mut _watchers: Vec<AbortOnDrop> = Vec::with_capacity(inners.len());
     for inner in inners {
         let inner = inner.clone();
         let tx = tx.clone();
-        watchers.push(tokio::spawn(async move {
+        _watchers.push(AbortOnDrop(tokio::spawn(async move {
             loop {
                 inner.notify.notified().await;
                 if inner.eof.load(Ordering::Acquire) {
@@ -337,7 +471,7 @@ async fn wait_for_any_drainable(inners: &[Arc<SessionInner>], deadline: Duration
                 // notify, don't wake the caller.
             }
             let _ = tx.try_send(());
-        }));
+        })));
     }
     drop(tx);
 
@@ -355,9 +489,9 @@ async fn wait_for_any_drainable(inners: &[Arc<SessionInner>], deadline: Duration
         }
     }
 
-    for w in &watchers {
-        w.abort();
-    }
+    // No explicit abort loop: `_watchers`'s `AbortOnDrop` entries fire
+    // on the function returning here AND on the future being dropped
+    // mid-await by an outer `select!`.
 }
 
 /// True iff any session is currently drainable: its read buffer has
@@ -395,12 +529,14 @@ async fn wait_for_any_udp_drainable(inners: &[Arc<UdpSessionInner>], deadline: D
         return;
     }
 
+    // See `AbortOnDrop` and the comment on `wait_for_any_drainable`
+    // for why watchers must be aborted on every exit path.
     let (tx, mut rx) = mpsc::channel::<()>(1);
-    let mut watchers = Vec::with_capacity(inners.len());
+    let mut _watchers: Vec<AbortOnDrop> = Vec::with_capacity(inners.len());
     for inner in inners {
         let inner = inner.clone();
         let tx = tx.clone();
-        watchers.push(tokio::spawn(async move {
+        _watchers.push(AbortOnDrop(tokio::spawn(async move {
             loop {
                 inner.notify.notified().await;
                 if inner.eof.load(Ordering::Acquire) {
@@ -413,7 +549,7 @@ async fn wait_for_any_udp_drainable(inners: &[Arc<UdpSessionInner>], deadline: D
                 // prior batch. Loop back, don't wake the caller.
             }
             let _ = tx.try_send(());
-        }));
+        })));
     }
     drop(tx);
 
@@ -423,10 +559,6 @@ async fn wait_for_any_udp_drainable(inners: &[Arc<UdpSessionInner>], deadline: D
             _ = rx.recv() => {}
             _ = tokio::time::sleep(deadline) => {}
         }
-    }
-
-    for w in &watchers {
-        w.abort();
     }
 }
 
@@ -479,7 +611,20 @@ async fn wait_and_drain(session: &SessionInner, max_wait: Duration) -> (Vec<u8>,
 struct AppState {
     sessions: Arc<Mutex<HashMap<String, ManagedSession>>>,
     udp_sessions: Arc<Mutex<HashMap<String, ManagedUdpSession>>>,
-    auth_key: String,
+    /// Shared, immutable after startup. `Arc<str>` so each `state.clone()`
+    /// — once per phase-1 spawn in the batch handler — is a refcount bump
+    /// instead of a fresh String allocation.
+    auth_key: Arc<str>,
+    /// Active probing defense: when false (default, production), bad
+    /// AUTH_KEY responses are a generic-looking 404 with no JSON-shaped
+    /// "unauthorized" body — same as a static nginx 404. Active scanners
+    /// that POST malformed payloads to `/tunnel` to discover proxy
+    /// endpoints categorize this as a non-tunnel host and move on.
+    /// Enable via `MHRV_DIAGNOSTIC=1` for setup/debugging — restores the
+    /// previous JSON `{"e":"unauthorized"}` body so it's clear *which*
+    /// of "wrong key", "wrong URL path", or "wrong tunnel-node" you've
+    /// hit. (Inspired by #365 Section 3.)
+    diagnostic_mode: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -507,17 +652,19 @@ struct TunnelResponse {
     #[serde(skip_serializing_if = "Option::is_none")] eof: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")] e: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")] code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")] seq: Option<u64>,
 }
 
 impl TunnelResponse {
     fn error(msg: impl Into<String>) -> Self {
-        Self { sid: None, d: None, pkts: None, eof: None, e: Some(msg.into()), code: None }
+        Self { sid: None, d: None, pkts: None, eof: None, e: Some(msg.into()), code: None, seq: None }
     }
     fn unsupported_op(op: &str) -> Self {
         Self {
             sid: None, d: None, pkts: None, eof: None,
             e: Some(format!("unknown op: {}", op)),
             code: Some(CODE_UNSUPPORTED_OP.into()),
+            seq: None,
         }
     }
 }
@@ -539,6 +686,8 @@ struct BatchOp {
     #[serde(default)] host: Option<String>,
     #[serde(default)] port: Option<u16>,
     #[serde(default)] d: Option<String>, // base64 data
+    #[serde(default)] seq: Option<u64>,
+    #[serde(default)] wseq: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -553,19 +702,41 @@ struct BatchResponse {
 async fn handle_tunnel(
     State(state): State<AppState>,
     Json(req): Json<TunnelRequest>,
-) -> Json<TunnelResponse> {
-    if req.k != state.auth_key {
-        return Json(TunnelResponse::error("unauthorized"));
+) -> axum::response::Response {
+    if req.k != *state.auth_key {
+        return decoy_or_unauthorized(state.diagnostic_mode);
     }
-    match req.op.as_str() {
-        "connect" => Json(handle_connect(&state, req.host, req.port).await),
+    let resp: TunnelResponse = match req.op.as_str() {
+        "connect" => handle_connect(&state, req.host, req.port).await,
         "connect_data" => {
-            Json(handle_connect_data_single(&state, req.host, req.port, req.data).await)
+            handle_connect_data_single(&state, req.host, req.port, req.data).await
         }
-        "data" => Json(handle_data_single(&state, req.sid, req.data).await),
-        "close" => Json(handle_close(&state, req.sid).await),
-        other => Json(TunnelResponse::unsupported_op(other)),
+        "data" => handle_data_single(&state, req.sid, req.data).await,
+        "close" => handle_close(&state, req.sid).await,
+        other => TunnelResponse::unsupported_op(other),
+    };
+    Json(resp).into_response()
+}
+
+/// Active-probing defense for the bad-auth path. Production default is
+/// a 404 with a generic "Not Found" HTML body that mimics a vanilla
+/// nginx/apache static error page — active scanners categorize this
+/// as a regular web server with nothing interesting and move on.
+/// `MHRV_DIAGNOSTIC=1` restores the previous JSON `{"e":"unauthorized"}`
+/// body so misconfigured clients get a clear error during setup.
+fn decoy_or_unauthorized(diagnostic_mode: bool) -> axum::response::Response {
+    if diagnostic_mode {
+        return Json(TunnelResponse::error("unauthorized")).into_response();
     }
+    let body = "<html>\r\n<head><title>404 Not Found</title></head>\r\n\
+                <body>\r\n<center><h1>404 Not Found</h1></center>\r\n\
+                <hr><center>nginx</center>\r\n</body>\r\n</html>\r\n";
+    (
+        StatusCode::NOT_FOUND,
+        [(header::CONTENT_TYPE, "text/html")],
+        body,
+    )
+        .into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -601,11 +772,21 @@ async fn handle_batch(
         }
     };
 
-    if req.k != state.auth_key {
-        let resp = serde_json::to_vec(&BatchResponse {
-            r: vec![TunnelResponse::error("unauthorized")],
-        }).unwrap_or_default();
-        return (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], resp);
+    if req.k != *state.auth_key {
+        if state.diagnostic_mode {
+            let resp = serde_json::to_vec(&BatchResponse {
+                r: vec![TunnelResponse::error("unauthorized")],
+            }).unwrap_or_default();
+            return (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], resp);
+        }
+        // Production: same nginx-404 decoy as the single-op path. See
+        // `decoy_or_unauthorized` for rationale.
+        let body = "<html>\r\n<head><title>404 Not Found</title></head>\r\n\
+                    <body>\r\n<center><h1>404 Not Found</h1></center>\r\n\
+                    <hr><center>nginx</center>\r\n</body>\r\n</html>\r\n"
+            .as_bytes()
+            .to_vec();
+        return (StatusCode::NOT_FOUND, [(header::CONTENT_TYPE, "text/html")], body);
     }
 
     // Process all ops in two phases.
@@ -624,8 +805,13 @@ async fn handle_batch(
     // still fires from server-speaks-first ports and from the preread
     // timeout fallback path.
     let mut results: Vec<(usize, TunnelResponse)> = Vec::with_capacity(req.ops.len());
-    let mut tcp_drains: Vec<(usize, String)> = Vec::new();
-    let mut udp_drains: Vec<(usize, String)> = Vec::new();
+    // Each drain entry carries the session's `Arc<…Inner>` alongside the
+    // sid. Phase 2 drains through the Arc directly so the global sessions
+    // map lock isn't held across the per-session read_buf / packets
+    // mutex acquisition — without this, every other batch (and every
+    // connect/close op) head-of-line-blocks behind the drain.
+    let mut tcp_drains: Vec<(usize, String, Arc<SessionInner>, Option<u64>)> = Vec::new();
+    let mut udp_drains: Vec<(usize, String, Arc<UdpSessionInner>, Option<u64>)> = Vec::new();
     // True iff the batch contained any op that performed a real action
     // upstream — a new connection or a non-empty data write. A batch of
     // only empty "data" / "udp_data" polls (and possibly closes) leaves
@@ -634,8 +820,8 @@ async fn handle_batch(
 
     enum NewConn {
         Connect(TunnelResponse),
-        ConnectData(Result<String, TunnelResponse>),
-        UdpOpen(Result<String, TunnelResponse>),
+        ConnectData(Result<(String, Arc<SessionInner>), TunnelResponse>),
+        UdpOpen(Result<(String, Arc<UdpSessionInner>), TunnelResponse>),
     }
     let mut new_conn_jobs: JoinSet<(usize, NewConn)> = JoinSet::new();
 
@@ -657,13 +843,11 @@ async fn handle_batch(
                 let port = op.port;
                 let d = op.d.clone();
                 new_conn_jobs.spawn(async move {
-                    // Drop the returned Arc<SessionInner>: phase 2 below
-                    // re-looks up each sid under one sessions-map lock,
-                    // which is cheap. The Arc return is a convenience for
-                    // the single-op path only.
-                    let r = handle_connect_data_phase1(&state, host, port, d)
-                        .await
-                        .map(|(sid, _inner)| sid);
+                    // Keep the returned Arc<SessionInner>: phase 2 drains
+                    // through it directly, so the global sessions map
+                    // lock doesn't have to be held across the per-session
+                    // read_buf.lock().await.
+                    let r = handle_connect_data_phase1(&state, host, port, d).await;
                     (i, NewConn::ConnectData(r))
                 });
             }
@@ -680,9 +864,7 @@ async fn handle_batch(
                 let port = op.port;
                 let d = op.d.clone();
                 new_conn_jobs.spawn(async move {
-                    let r = handle_udp_open_phase1(&state, host, port, d)
-                        .await
-                        .map(|(sid, _inner)| sid);
+                    let r = handle_udp_open_phase1(&state, host, port, d).await;
                     (i, NewConn::UdpOpen(r))
                 });
             }
@@ -692,27 +874,92 @@ async fn handle_batch(
                     _ => { results.push((i, TunnelResponse::error("missing sid"))); continue; }
                 };
 
-                // Write outbound data
-                let sessions = state.sessions.lock().await;
-                if let Some(session) = sessions.get(&sid) {
-                    *session.inner.last_active.lock().await = Instant::now();
+                // Clone the inner under the map lock and release it
+                // before any await. The previous shape held the global
+                // sessions map across last_active.lock(), writer.lock(),
+                // write_all, and flush — head-of-line-blocking every
+                // other batch and connect/close op for the duration of
+                // a single upstream write. The udp_data branch below
+                // already does the right thing; this matches it.
+                let inner = {
+                    let sessions = state.sessions.lock().await;
+                    sessions.get(&sid).map(|s| s.inner.clone())
+                };
+                if let Some(inner) = inner {
+                    *inner.last_active.lock().await = Instant::now();
                     if let Some(ref data_b64) = op.d {
                         if !data_b64.is_empty() {
-                            had_writes_or_connects = true;
-                            if let Ok(bytes) = B64.decode(data_b64) {
-                                if !bytes.is_empty() {
-                                    let mut w = session.inner.writer.lock().await;
-                                    let _ = w.write_all(&bytes).await;
-                                    let _ = w.flush().await;
+                            // Decode first; only count this op as a real
+                            // write (and demote the batch out of long-poll)
+                            // after a successful non-empty decode. Mirrors
+                            // the udp_data branch and avoids silently
+                            // dropping bytes on bad base64.
+                            let bytes = match B64.decode(data_b64) {
+                                Ok(b) => b,
+                                Err(e) => {
+                                    results.push((
+                                        i,
+                                        TunnelResponse::error(format!("bad base64: {}", e)),
+                                    ));
+                                    continue;
+                                }
+                            };
+                            if !bytes.is_empty() {
+                                had_writes_or_connects = true;
+                                tracing::info!(
+                                    "session {} upload {}B wseq={:?}",
+                                    &sid[..sid.len().min(8)], bytes.len(), op.wseq,
+                                );
+                                match op.wseq {
+                                    None => {
+                                        // Old client (no wseq): write immediately.
+                                        let mut w = inner.writer.lock().await;
+                                        let _ = w.write_all(&bytes).await;
+                                        let _ = w.flush().await;
+                                    }
+                                    Some(wseq) => {
+                                        let mut nws = inner.next_write_seq.lock().await;
+                                        let expected = nws.get_or_insert(wseq);
+
+                                        if wseq < *expected {
+                                            // Stale / duplicate — skip.
+                                            tracing::debug!(
+                                                "session {} wseq {} < expected {} — skipping",
+                                                &sid[..sid.len().min(8)], wseq, *expected,
+                                            );
+                                        } else if wseq == *expected {
+                                            // In order — write immediately.
+                                            let mut w = inner.writer.lock().await;
+                                            let _ = w.write_all(&bytes).await;
+                                            *expected += 1;
+
+                                            // Flush any buffered writes that
+                                            // are now in sequence.
+                                            let mut pw = inner.pending_writes.lock().await;
+                                            while let Some(entry) = pw.first_entry() {
+                                                if *entry.key() != *expected { break; }
+                                                let (_, buffered) = entry.remove_entry();
+                                                let _ = w.write_all(&buffered).await;
+                                                *expected += 1;
+                                            }
+                                            let _ = w.flush().await;
+                                        } else {
+                                            // Out of order — buffer for later.
+                                            tracing::debug!(
+                                                "session {} wseq {} > expected {} — buffering",
+                                                &sid[..sid.len().min(8)], wseq, *expected,
+                                            );
+                                            let mut pw = inner.pending_writes.lock().await;
+                                            pw.insert(wseq, bytes);
+                                        }
+                                    }
                                 }
                             }
                         }
                     }
-                    drop(sessions);
-                    tcp_drains.push((i, sid));
+                    tcp_drains.push((i, sid, inner, op.seq));
                 } else {
-                    drop(sessions);
-                    results.push((i, eof_response(sid)));
+                    results.push((i, eof_response(sid, op.seq)));
                 }
             }
             "udp_data" => {
@@ -753,9 +1000,9 @@ async fn handle_batch(
                     if had_uplink {
                         *inner.last_active.lock().await = Instant::now();
                     }
-                    udp_drains.push((i, sid));
+                    udp_drains.push((i, sid, inner, op.seq));
                 } else {
-                    results.push((i, eof_response(sid)));
+                    results.push((i, eof_response(sid, op.seq)));
                 }
             }
             "close" => {
@@ -774,9 +1021,13 @@ async fn handle_batch(
     while let Some(join) = new_conn_jobs.join_next().await {
         match join {
             Ok((i, NewConn::Connect(r))) => results.push((i, r)),
-            Ok((i, NewConn::ConnectData(Ok(sid)))) => tcp_drains.push((i, sid)),
+            Ok((i, NewConn::ConnectData(Ok((sid, inner))))) => {
+                tcp_drains.push((i, sid, inner, None));
+            }
             Ok((i, NewConn::ConnectData(Err(r)))) => results.push((i, r)),
-            Ok((i, NewConn::UdpOpen(Ok(sid)))) => udp_drains.push((i, sid)),
+            Ok((i, NewConn::UdpOpen(Ok((sid, inner))))) => {
+                udp_drains.push((i, sid, inner, None));
+            }
             Ok((i, NewConn::UdpOpen(Err(r)))) => results.push((i, r)),
             Err(e) => {
                 tracing::error!("new-connection task panicked: {}", e);
@@ -802,90 +1053,159 @@ async fn handle_batch(
             LONGPOLL_DEADLINE
         };
 
-        let tcp_inners: Vec<Arc<SessionInner>> = {
-            let sessions = state.sessions.lock().await;
-            tcp_drains
-                .iter()
-                .filter_map(|(_, sid)| sessions.get(sid).map(|s| s.inner.clone()))
-                .collect()
-        };
-        let udp_inners: Vec<Arc<UdpSessionInner>> = {
-            let sessions = state.udp_sessions.lock().await;
-            udp_drains
-                .iter()
-                .filter_map(|(_, sid)| sessions.get(sid).map(|s| s.inner.clone()))
-                .collect()
-        };
+        // Phase 1 already gave us each session's Arc<…Inner>, so we
+        // don't need to re-acquire the sessions map lock here. Cloning
+        // the Arc is just a refcount bump.
+        let tcp_inners: Vec<Arc<SessionInner>> =
+            tcp_drains.iter().map(|(_, _, inner, _)| inner.clone()).collect();
+        let udp_inners: Vec<Arc<UdpSessionInner>> =
+            udp_drains.iter().map(|(_, _, inner, _)| inner.clone()).collect();
 
-        let wait_start = Instant::now();
-        // Wait for either side to wake. Running both concurrently means
-        // a TCP-only batch isn't slowed by a stale UDP watch list, and
-        // vice versa.
-        tokio::join!(
-            wait_for_any_drainable(&tcp_inners, deadline),
-            wait_for_any_udp_drainable(&udp_inners, deadline),
-        );
+        // Wake on whichever side has work first. The previous
+        // `tokio::join!` was conjunctive — a TCP burst still paid the
+        // UDP deadline in mixed batches because the UDP waiter had to
+        // elapse too. `wait_for_*_drainable` short-circuits on an empty
+        // slice, so we have to skip the empty side; otherwise its
+        // instant return would fire the select arm before the other
+        // side ever got a chance to wait.
+        match (tcp_inners.is_empty(), udp_inners.is_empty()) {
+            (true, true) => {}
+            (false, true) => wait_for_any_drainable(&tcp_inners, deadline).await,
+            (true, false) => wait_for_any_udp_drainable(&udp_inners, deadline).await,
+            (false, false) => {
+                tokio::select! {
+                    _ = wait_for_any_drainable(&tcp_inners, deadline) => {}
+                    _ = wait_for_any_udp_drainable(&udp_inners, deadline) => {}
+                }
+            }
+        }
 
         if had_writes_or_connects {
-            let remaining = deadline.saturating_sub(wait_start.elapsed());
-            if !remaining.is_zero() {
-                tokio::time::sleep(STRAGGLER_SETTLE.min(remaining)).await;
+            // Adaptive settle: keep waiting in steps while new data
+            // keeps arriving. Break when:
+            //  1. No new data arrived in the last step (burst is over)
+            //  2. STRAGGLER_SETTLE_MAX reached
+            let settle_end = Instant::now() + STRAGGLER_SETTLE_MAX;
+            let mut prev_tcp_bytes: usize = 0;
+            let mut prev_udp_pkts: usize = 0;
+            // Snapshot current buffer sizes.
+            for inner in &tcp_inners {
+                prev_tcp_bytes += inner.read_buf.lock().await.len();
+            }
+            for inner in &udp_inners {
+                prev_udp_pkts += inner.packets.lock().await.len();
+            }
+            loop {
+                let now = Instant::now();
+                if now >= settle_end {
+                    break;
+                }
+                let remaining = settle_end.duration_since(now);
+                tokio::time::sleep(STRAGGLER_SETTLE_STEP.min(remaining)).await;
+
+                // Measure current buffer sizes.
+                let mut tcp_bytes: usize = 0;
+                let mut udp_pkts: usize = 0;
+                for inner in &tcp_inners {
+                    tcp_bytes += inner.read_buf.lock().await.len();
+                }
+                for inner in &udp_inners {
+                    udp_pkts += inner.packets.lock().await.len();
+                }
+
+                // No new data since last step — burst is over.
+                if tcp_bytes == prev_tcp_bytes && udp_pkts == prev_udp_pkts {
+                    break;
+                }
+
+                prev_tcp_bytes = tcp_bytes;
+                prev_udp_pkts = udp_pkts;
             }
         }
 
         // ---- TCP drain ----
-        if !tcp_drains.is_empty() {
-            let sessions = state.sessions.lock().await;
-            for (i, sid) in &tcp_drains {
-                if let Some(session) = sessions.get(sid) {
-                    let (data, eof) = drain_now(&session.inner).await;
-                    results.push((*i, tcp_drain_response(sid.clone(), data, eof)));
-                } else {
-                    results.push((*i, eof_response(sid.clone())));
-                }
+        // Drain through each session's already-cloned Arc so the global
+        // sessions map lock isn't held across the per-session
+        // read_buf.lock().await.
+        //
+        // Cleanup is driven off `drain_now`'s returned `eof`, NOT the
+        // raw `inner.eof` atomic. When the buffer exceeds
+        // `TCP_DRAIN_MAX_BYTES`, `drain_now` deliberately returns
+        // `eof = false` and leaves the tail in the buffer so the
+        // client can pick it up on the next poll. The previous cleanup
+        // read the atomic directly, so on a high-throughput session
+        // that closed mid-burst (issue #460-style) it would remove the
+        // session and abort the reader_task with the tail still
+        // buffered, dropping those bytes.
+        let mut tcp_eof_sids: Vec<String> = Vec::new();
+        // Track remaining batch-response budget across all session drains
+        // (#863). Per-session `TCP_DRAIN_MAX_BYTES` alone wasn't enough —
+        // several concurrent sessions each contributing 16 MiB summed past
+        // Apps Script's 50 MiB response ceiling. This cap stops one session
+        // short of the cliff; deferred sessions drain on the next poll.
+        let mut remaining_budget: usize = BATCH_RESPONSE_BUDGET;
+        for (i, sid, inner, seq) in &tcp_drains {
+            // Drain in a loop: keep reading until the buffer is empty
+            // so we catch data that arrives during the drain itself.
+            let mut all_data = Vec::new();
+            let mut final_eof = false;
+            let drain_deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                let (data, eof) = drain_now(inner, remaining_budget.saturating_sub(all_data.len())).await;
+                if eof { final_eof = true; }
+                if data.is_empty() { break; }
+                let hit_session_cap = data.len() >= TCP_DRAIN_MAX_BYTES;
+                all_data.extend_from_slice(&data);
+                if final_eof || hit_session_cap || all_data.len() >= remaining_budget { break; }
+                if Instant::now() >= drain_deadline { break; }
+                // Brief yield to let reader_task finish its current read
+                tokio::task::yield_now().await;
             }
-            drop(sessions);
-
-            // Clean up eof TCP sessions.
+            let drained = all_data.len();
+            if drained > 0 {
+                tracing::info!("session {} drained {}KB", &sid[..sid.len().min(8)], drained / 1024);
+            }
+            if final_eof {
+                tcp_eof_sids.push(sid.clone());
+            }
+            results.push((*i, tcp_drain_response(sid.clone(), all_data, final_eof, *seq)));
+            remaining_budget = remaining_budget.saturating_sub(drained);
+            if remaining_budget == 0 {
+                break;
+            }
+        }
+        if !tcp_eof_sids.is_empty() {
             let mut sessions = state.sessions.lock().await;
-            for (_, sid) in &tcp_drains {
-                if let Some(s) = sessions.get(sid) {
-                    if s.inner.eof.load(Ordering::Acquire) {
-                        if let Some(s) = sessions.remove(sid) {
-                            s.reader_handle.abort();
-                            tracing::info!("session {} closed by remote (batch)", sid);
-                        }
-                    }
+            for sid in &tcp_eof_sids {
+                if let Some(s) = sessions.remove(sid) {
+                    s.reader_handle.abort();
+                    tracing::info!("session {} closed by remote (batch)", sid);
                 }
             }
         }
 
         // ---- UDP drain ----
-        if !udp_drains.is_empty() {
-            {
-                let sessions = state.udp_sessions.lock().await;
-                for (i, sid) in &udp_drains {
-                    if let Some(session) = sessions.get(sid) {
-                        let (packets, eof) = drain_udp_now(&session.inner).await;
-                        results.push((*i, udp_drain_response(sid.clone(), packets, eof)));
-                    } else {
-                        results.push((*i, eof_response(sid.clone())));
-                    }
-                }
+        // Same shape as TCP. `drain_udp_now` currently drains the full
+        // queue with no per-batch cap, so its returned `eof` already
+        // matches the atomic — driving cleanup off the drain return
+        // is future-proofing: if a UDP per-batch packet cap is ever
+        // added (mirroring `TCP_DRAIN_MAX_BYTES`), the same data-loss
+        // trap that motivated the TCP-side fix reappears, and tracking
+        // eof from the drain return rather than the atomic catches it.
+        let mut udp_eof_sids: Vec<String> = Vec::new();
+        for (i, sid, inner, seq) in &udp_drains {
+            let (packets, eof) = drain_udp_now(inner).await;
+            if eof {
+                udp_eof_sids.push(sid.clone());
             }
-
-            // Clean up eof UDP sessions so a future batch with the same
-            // sid gets the "session not found" eof immediately rather
-            // than re-checking the (already-stale) eof flag.
+            results.push((*i, udp_drain_response(sid.clone(), packets, eof, *seq)));
+        }
+        if !udp_eof_sids.is_empty() {
             let mut sessions = state.udp_sessions.lock().await;
-            for (_, sid) in &udp_drains {
-                if let Some(s) = sessions.get(sid) {
-                    if s.inner.eof.load(Ordering::Acquire) {
-                        if let Some(s) = sessions.remove(sid) {
-                            s.reader_handle.abort();
-                            tracing::info!("udp session {} closed by remote (batch)", sid);
-                        }
-                    }
+            for sid in &udp_eof_sids {
+                if let Some(s) = sessions.remove(sid) {
+                    s.reader_handle.abort();
+                    tracing::info!("udp session {} closed by remote (batch)", sid);
                 }
             }
         }
@@ -901,7 +1221,7 @@ async fn handle_batch(
     (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], json)
 }
 
-fn tcp_drain_response(sid: String, data: Vec<u8>, eof: bool) -> TunnelResponse {
+fn tcp_drain_response(sid: String, data: Vec<u8>, eof: bool, seq: Option<u64>) -> TunnelResponse {
     TunnelResponse {
         sid: Some(sid),
         d: if data.is_empty() { None } else { Some(B64.encode(&data)) },
@@ -909,10 +1229,11 @@ fn tcp_drain_response(sid: String, data: Vec<u8>, eof: bool) -> TunnelResponse {
         eof: Some(eof),
         e: None,
         code: None,
+        seq,
     }
 }
 
-fn udp_drain_response(sid: String, packets: Vec<Vec<u8>>, eof: bool) -> TunnelResponse {
+fn udp_drain_response(sid: String, packets: Vec<Vec<u8>>, eof: bool, seq: Option<u64>) -> TunnelResponse {
     let pkts = if packets.is_empty() {
         None
     } else {
@@ -925,10 +1246,11 @@ fn udp_drain_response(sid: String, packets: Vec<Vec<u8>>, eof: bool) -> TunnelRe
         eof: Some(eof),
         e: None,
         code: None,
+        seq,
     }
 }
 
-fn eof_response(sid: String) -> TunnelResponse {
+fn eof_response(sid: String, seq: Option<u64>) -> TunnelResponse {
     TunnelResponse {
         sid: Some(sid),
         d: None,
@@ -936,6 +1258,7 @@ fn eof_response(sid: String) -> TunnelResponse {
         eof: Some(true),
         e: None,
         code: None,
+        seq,
     }
 }
 
@@ -971,22 +1294,27 @@ async fn handle_connect(state: &AppState, host: Option<String>, port: Option<u16
         Ok(v) => v,
         Err(r) => return r,
     };
-    let session = match create_session(&host, port).await {
-        Ok(s) => s,
-        Err(e) => return TunnelResponse::error(format!("connect failed: {}", e)),
+    let session = if udpgw::is_udpgw_dest(&host, port) {
+        create_udpgw_session()
+    } else {
+        match create_session(&host, port).await {
+            Ok(s) => s,
+            Err(e) => return TunnelResponse::error(format!("connect failed: {}", e)),
+        }
     };
     let sid = uuid::Uuid::new_v4().to_string();
     tracing::info!("session {} -> {}:{}", sid, host, port);
     state.sessions.lock().await.insert(sid.clone(), session);
-    TunnelResponse { sid: Some(sid), d: None, pkts: None, eof: Some(false), e: None, code: None }
+    TunnelResponse { sid: Some(sid), d: None, pkts: None, eof: Some(false), e: None, code: None, seq: None }
 }
 
 /// Open a session and write the client's first bytes in one round trip.
-/// Returns the new sid plus an `Arc<SessionInner>` so unary callers
-/// (`handle_connect_data_single`) can drain the first response without a
-/// second sessions-map lookup. The batch caller drops the Arc — it takes
-/// a single lock across all drain-bound sessions in phase 2, which is
-/// cheaper than the Arc plumbing would be.
+/// Returns the new sid plus an `Arc<SessionInner>`. Both callers keep
+/// the Arc: the unary path (`handle_connect_data_single`) uses it to
+/// drain the first response without a second sessions-map lookup, and
+/// the batch path threads it into `tcp_drains` so phase-2 drain runs
+/// without holding the global sessions map lock across the per-session
+/// `read_buf.lock().await`.
 async fn handle_connect_data_phase1(
     state: &AppState,
     host: Option<String>,
@@ -995,9 +1323,13 @@ async fn handle_connect_data_phase1(
 ) -> Result<(String, Arc<SessionInner>), TunnelResponse> {
     let (host, port) = validate_host_port(host, port)?;
 
-    let session = create_session(&host, port)
-        .await
-        .map_err(|e| TunnelResponse::error(format!("connect failed: {}", e)))?;
+    let session = if udpgw::is_udpgw_dest(&host, port) {
+        create_udpgw_session()
+    } else {
+        create_session(&host, port)
+            .await
+            .map_err(|e| TunnelResponse::error(format!("connect failed: {}", e)))?
+    };
 
     // Any failure below this point must abort the reader task, otherwise
     // the newly-opened upstream TCP connection would leak. Keep the
@@ -1095,6 +1427,7 @@ async fn handle_connect_data_single(
         eof: Some(eof),
         e: None,
         code: None,
+        seq: None,
     }
 }
 
@@ -1103,19 +1436,27 @@ async fn handle_data_single(state: &AppState, sid: Option<String>, data: Option<
         Some(s) if !s.is_empty() => s,
         _ => return TunnelResponse::error("missing sid"),
     };
-    let sessions = state.sessions.lock().await;
-    let session = match sessions.get(&sid) {
-        Some(s) => s,
+    // Clone the inner Arc under the global sessions map lock and release
+    // the map lock before any await. The previous shape held the map
+    // across last_active.lock(), writer.lock(), write_all, flush, AND
+    // wait_and_drain — up to 5 s of head-of-line blocking on every other
+    // single-op or batch request. Mirrors the batch-handler "data" path.
+    let inner = {
+        let sessions = state.sessions.lock().await;
+        sessions.get(&sid).map(|s| s.inner.clone())
+    };
+    let inner = match inner {
+        Some(i) => i,
         None => return TunnelResponse::error("unknown session"),
     };
-    *session.inner.last_active.lock().await = Instant::now();
+    *inner.last_active.lock().await = Instant::now();
     if let Some(ref data_b64) = data {
         if !data_b64.is_empty() {
             if let Ok(bytes) = B64.decode(data_b64) {
                 if !bytes.is_empty() {
-                    let mut w = session.inner.writer.lock().await;
+                    let mut w = inner.writer.lock().await;
                     if let Err(e) = w.write_all(&bytes).await {
-                        drop(w); drop(sessions);
+                        drop(w);
                         state.sessions.lock().await.remove(&sid);
                         return TunnelResponse::error(format!("write failed: {}", e));
                     }
@@ -1124,8 +1465,7 @@ async fn handle_data_single(state: &AppState, sid: Option<String>, data: Option<
             }
         }
     }
-    let (data, eof) = wait_and_drain(&session.inner, Duration::from_secs(5)).await;
-    drop(sessions);
+    let (data, eof) = wait_and_drain(&inner, Duration::from_secs(5)).await;
     if eof {
         if let Some(s) = state.sessions.lock().await.remove(&sid) {
             s.reader_handle.abort();
@@ -1136,7 +1476,7 @@ async fn handle_data_single(state: &AppState, sid: Option<String>, data: Option<
         sid: Some(sid),
         d: if data.is_empty() { None } else { Some(B64.encode(&data)) },
         pkts: None,
-        eof: Some(eof), e: None, code: None,
+        eof: Some(eof), e: None, code: None, seq: None,
     }
 }
 
@@ -1146,14 +1486,14 @@ async fn handle_close(state: &AppState, sid: Option<String>) -> TunnelResponse {
         _ => return TunnelResponse::error("missing sid"),
     };
     if let Some(s) = state.sessions.lock().await.remove(&sid) {
-        s.reader_handle.abort();
+        s.abort_all();
         tracing::info!("session {} closed by client", sid);
     }
     if let Some(s) = state.udp_sessions.lock().await.remove(&sid) {
         s.reader_handle.abort();
         tracing::info!("udp session {} closed by client", sid);
     }
-    TunnelResponse { sid: Some(sid), d: None, pkts: None, eof: Some(true), e: None, code: None }
+    TunnelResponse { sid: Some(sid), d: None, pkts: None, eof: Some(true), e: None, code: None, seq: None }
 }
 
 // ---------------------------------------------------------------------------
@@ -1234,7 +1574,24 @@ async fn main() {
         .init();
 
     let auth_key = std::env::var("TUNNEL_AUTH_KEY").unwrap_or_else(|_| {
-        tracing::warn!("TUNNEL_AUTH_KEY not set — using default (INSECURE)");
+        // Catch the recurring `MHRV_AUTH_KEY` typo (#391, #444). Several old
+        // copy-paste guides used `MHRV_AUTH_KEY` for the docker run; tunnel-node
+        // never read that name and silently fell through to `changeme`,
+        // producing baffling AUTH_KEY-mismatch decoys on the client. If
+        // `MHRV_AUTH_KEY` is set, point at it specifically so the user sees
+        // why their value isn't taking effect.
+        if std::env::var("MHRV_AUTH_KEY").is_ok() {
+            tracing::warn!(
+                "MHRV_AUTH_KEY is set but TUNNEL_AUTH_KEY is not — \
+                 tunnel-node only reads TUNNEL_AUTH_KEY (uppercase, with \
+                 underscores). Rename your env var: \
+                 `docker run ... -e TUNNEL_AUTH_KEY=<your-secret>`. Falling \
+                 back to default `changeme` for now (INSECURE — clients will \
+                 fail with AUTH_KEY mismatch decoys until this is fixed)."
+            );
+        } else {
+            tracing::warn!("TUNNEL_AUTH_KEY not set — using default (INSECURE)");
+        }
         "changeme".into()
     });
     let port: u16 = std::env::var("PORT")
@@ -1248,7 +1605,25 @@ async fn main() {
         Arc::new(Mutex::new(HashMap::new()));
     tokio::spawn(cleanup_task(sessions.clone(), udp_sessions.clone()));
 
-    let state = AppState { sessions, udp_sessions, auth_key };
+    // MHRV_DIAGNOSTIC=1 in env restores verbose JSON error responses on
+    // bad auth (instead of the nginx-404 decoy). Use during setup so
+    // misconfigured clients see "unauthorized"; flip back off in prod.
+    let diagnostic_mode = std::env::var("MHRV_DIAGNOSTIC")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if diagnostic_mode {
+        tracing::warn!(
+            "MHRV_DIAGNOSTIC=1 — bad-auth responses are verbose JSON \
+             errors instead of the production nginx-404 decoy. Disable \
+             before exposing this tunnel-node to the public internet."
+        );
+    }
+    let state = AppState {
+        sessions,
+        udp_sessions,
+        auth_key: Arc::from(auth_key),
+        diagnostic_mode,
+    };
 
     let app = Router::new()
         .route("/tunnel", post(handle_tunnel))
@@ -1283,6 +1658,10 @@ mod tests {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             udp_sessions: Arc::new(Mutex::new(HashMap::new())),
             auth_key: "test-key".into(),
+            // Tests assert against the JSON `unauthorized` body shape
+            // (see e.g. `bad_auth_returns_unauthorized`), so they need
+            // diagnostic_mode enabled. Production default is false.
+            diagnostic_mode: true,
         }
     }
 
@@ -1430,12 +1809,98 @@ mod tests {
         let (_reader, writer) = client.into_split();
 
         Arc::new(SessionInner {
-            writer: Mutex::new(writer),
+            writer: Mutex::new(SessionWriter::Tcp(writer)),
             read_buf: Mutex::new(Vec::new()),
             eof: AtomicBool::new(false),
             last_active: Mutex::new(Instant::now()),
             notify: Notify::new(),
+            next_write_seq: Mutex::new(None),
+            pending_writes: Mutex::new(std::collections::BTreeMap::new()),
         })
+    }
+
+    #[tokio::test]
+    async fn drain_now_caps_at_tcp_drain_max_bytes() {
+        // Issue #460: a 1 Gbps VPS reader fills the buffer with tens of MiB
+        // between polls; drain_now used to take the lot, the JSON response
+        // exceeded Apps Script's body cap, and the client failed JSON parse.
+        // The cap leaves the tail in the buffer for the next drain.
+        let inner = fake_inner().await;
+        let oversized = TCP_DRAIN_MAX_BYTES + 4096;
+        inner.read_buf.lock().await.resize(oversized, 0xab);
+
+        let (first, eof) = drain_now(&inner, usize::MAX).await;
+        assert_eq!(first.len(), TCP_DRAIN_MAX_BYTES);
+        assert!(!eof, "shouldn't propagate eof while buffer still has data");
+
+        // Tail remains for the next poll.
+        assert_eq!(inner.read_buf.lock().await.len(), 4096);
+
+        let (second, _) = drain_now(&inner, usize::MAX).await;
+        assert_eq!(second.len(), 4096);
+        assert!(inner.read_buf.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn drain_now_respects_caller_budget_below_per_session_cap() {
+        // Issue #863: per-session TCP_DRAIN_MAX_BYTES alone wasn't enough
+        // because N sessions × 16 MiB summed past Apps Script's 50 MiB
+        // response ceiling. The batch loop now passes a remaining-budget
+        // cap; drain_now must honor `min(budget, TCP_DRAIN_MAX_BYTES)`,
+        // leaving the tail for the next poll exactly like the per-session
+        // cap path does.
+        let inner = fake_inner().await;
+        // 1 MiB buffered, but caller only has 256 KiB budget left.
+        inner
+            .read_buf
+            .lock()
+            .await
+            .resize(1024 * 1024, 0xcd);
+
+        let (drained, eof) = drain_now(&inner, 256 * 1024).await;
+        assert_eq!(drained.len(), 256 * 1024);
+        assert!(!eof, "tail still buffered, eof must wait");
+
+        // The remaining 768 KiB stays put for the next poll.
+        assert_eq!(inner.read_buf.lock().await.len(), 768 * 1024);
+
+        // Next call with full budget drains the rest.
+        let (rest, _) = drain_now(&inner, usize::MAX).await;
+        assert_eq!(rest.len(), 768 * 1024);
+        assert!(inner.read_buf.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn drain_now_passes_through_when_under_cap() {
+        let inner = fake_inner().await;
+        inner.read_buf.lock().await.extend_from_slice(b"hello world");
+
+        let (data, eof) = drain_now(&inner, usize::MAX).await;
+        assert_eq!(data, b"hello world");
+        assert!(!eof);
+        assert!(inner.read_buf.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn drain_now_holds_eof_until_buffer_drained() {
+        // If upstream signals EOF while the buffer is still oversized, we
+        // must drain the head, leave the tail, and *not* set eof yet.
+        // Eof flips on the final drain that returns a sub-cap buffer.
+        let inner = fake_inner().await;
+        inner.eof.store(true, Ordering::Release);
+        inner
+            .read_buf
+            .lock()
+            .await
+            .resize(TCP_DRAIN_MAX_BYTES + 100, 0);
+
+        let (head, head_eof) = drain_now(&inner, usize::MAX).await;
+        assert_eq!(head.len(), TCP_DRAIN_MAX_BYTES);
+        assert!(!head_eof, "premature eof would tear the session");
+
+        let (tail, tail_eof) = drain_now(&inner, usize::MAX).await;
+        assert_eq!(tail.len(), 100);
+        assert!(tail_eof, "eof finally flips when buffer is drained");
     }
 
     #[tokio::test]
@@ -1597,11 +2062,13 @@ mod tests {
         let stream = TcpStream::connect(addr).await.unwrap();
         let (reader, writer) = stream.into_split();
         let inner = Arc::new(SessionInner {
-            writer: Mutex::new(writer),
+            writer: Mutex::new(SessionWriter::Tcp(writer)),
             read_buf: Mutex::new(Vec::new()),
             eof: AtomicBool::new(false),
             last_active: Mutex::new(Instant::now()),
             notify: Notify::new(),
+            next_write_seq: Mutex::new(None),
+            pending_writes: Mutex::new(std::collections::BTreeMap::new()),
         });
         let _reader_handle = tokio::spawn(reader_task(reader, inner.clone()));
 
@@ -1958,7 +2425,7 @@ mod tests {
         );
 
         // The `udp_drain_response` helper threads eof into `eof: Some(true)`.
-        let resp = udp_drain_response("zombie".into(), pkts, eof);
+        let resp = udp_drain_response("zombie".into(), pkts, eof, None);
         assert_eq!(resp.eof, Some(true));
         assert!(resp.pkts.is_none());
     }
@@ -1988,5 +2455,152 @@ mod tests {
         let r = parsed["r"].as_array().unwrap();
         assert_eq!(r.len(), 1);
         assert_eq!(r[0]["eof"], serde_json::Value::Bool(true));
+    }
+
+    /// Regression for the cleanup-correctness fix. Previously, the
+    /// batch handler reaped any session whose `inner.eof` atomic was
+    /// set, even when `drain_now` had withheld eof to keep tail bytes
+    /// buffered (i.e. the buffer exceeded `TCP_DRAIN_MAX_BYTES`).
+    /// Reaping aborted the reader_task and dropped the tail. Cleanup
+    /// is now driven off the drain's returned `eof`, so an over-cap
+    /// buffer + atomic eof keeps the session alive through the first
+    /// poll and only reaps on the drain that actually returns eof.
+    #[tokio::test]
+    async fn batch_keeps_over_cap_session_until_tail_is_drained() {
+        use axum::body::Bytes;
+        use axum::extract::State;
+
+        let state = fresh_state();
+        let inner = fake_inner().await;
+        // Prime an over-cap buffer + raw eof. drain_now will return
+        // TCP_DRAIN_MAX_BYTES bytes with eof=false; the previous
+        // cleanup would still reap because it read inner.eof directly.
+        inner
+            .read_buf
+            .lock()
+            .await
+            .resize(TCP_DRAIN_MAX_BYTES + 4096, 0u8);
+        inner.eof.store(true, Ordering::Release);
+
+        let sid = "over-cap-sid".to_string();
+        state.sessions.lock().await.insert(
+            sid.clone(),
+            ManagedSession {
+                inner: inner.clone(),
+                reader_handle: tokio::spawn(async {}),
+                udpgw_handle: None,
+            },
+        );
+
+        let body = serde_json::json!({
+            "k": "test-key",
+            "ops": [{"op": "data", "sid": &sid}]
+        })
+        .to_string();
+        let _resp = handle_batch(State(state.clone()), Bytes::from(body))
+            .await
+            .into_response();
+
+        // First poll: session must still be in the map, tail intact.
+        // The previous code reaped here and dropped the 4096 tail bytes.
+        {
+            let sessions = state.sessions.lock().await;
+            let s = sessions.get(&sid).expect(
+                "session removed despite tail bytes still buffered; \
+                 drain_now returned eof=false but cleanup ignored that \
+                 and read inner.eof directly",
+            );
+            let remaining = s.inner.read_buf.lock().await.len();
+            assert_eq!(remaining, 4096, "tail must be preserved for next drain");
+        }
+
+        // Second poll: drain_now sees buf.len() ≤ cap AND raw_eof,
+        // so returns eof=true. Cleanup runs and the session is reaped.
+        let body2 = serde_json::json!({
+            "k": "test-key",
+            "ops": [{"op": "data", "sid": &sid}]
+        })
+        .to_string();
+        let _resp2 = handle_batch(State(state.clone()), Bytes::from(body2))
+            .await
+            .into_response();
+
+        assert!(
+            !state.sessions.lock().await.contains_key(&sid),
+            "session should be reaped on the drain that returns eof=true",
+        );
+    }
+
+    /// Regression for the `tokio::join!` → `tokio::select!` mixed-drain
+    /// fix. Before the change, a TCP-ready / UDP-idle pure-poll batch
+    /// paid the full UDP `LONGPOLL_DEADLINE` (15 s) because the join
+    /// was conjunctive — both arms had to complete. Under select! the
+    /// TCP wake returns the response promptly even though UDP is
+    /// quiet. The bound is loose (1 s) on purpose: real elapsed is
+    /// in the millisecond range, but the prior bug would have
+    /// triggered the test timeout instead of the assert.
+    #[tokio::test]
+    async fn batch_tcp_ready_does_not_pay_udp_longpoll_deadline() {
+        use axum::body::Bytes;
+        use axum::extract::State;
+
+        let state = fresh_state();
+
+        // TCP session with bytes already buffered → immediately drainable.
+        let tcp_inner = fake_inner().await;
+        tcp_inner
+            .read_buf
+            .lock()
+            .await
+            .extend_from_slice(b"ready");
+        let tcp_sid = "tcp-sid".to_string();
+        state.sessions.lock().await.insert(
+            tcp_sid.clone(),
+            ManagedSession {
+                inner: tcp_inner,
+                reader_handle: tokio::spawn(async {}),
+                udpgw_handle: None,
+            },
+        );
+
+        // Idle UDP session — never wakes. Real upstream so udp_open
+        // succeeds; we just never send anything to it.
+        let udp_target = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
+        let udp_port = udp_target.local_addr().unwrap().port();
+        let (udp_sid, _udp_inner) = handle_udp_open_phase1(
+            &state,
+            Some("127.0.0.1".into()),
+            Some(udp_port),
+            None,
+        )
+        .await
+        .expect("udp open");
+
+        // Pure-poll batch (no `d` payload) → had_writes_or_connects =
+        // false → deadline = LONGPOLL_DEADLINE (15 s). Under the
+        // previous tokio::join! wait, the UDP arm would have held the
+        // response open for the full window even though TCP was
+        // already drainable.
+        let body = serde_json::json!({
+            "k": "test-key",
+            "ops": [
+                {"op": "data", "sid": &tcp_sid},
+                {"op": "udp_data", "sid": &udp_sid},
+            ]
+        })
+        .to_string();
+
+        let t0 = Instant::now();
+        let _resp = handle_batch(State(state.clone()), Bytes::from(body))
+            .await
+            .into_response();
+        let elapsed = t0.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "TCP-ready / UDP-idle pure-poll batch must not pay \
+             LONGPOLL_DEADLINE; elapsed={:?}",
+            elapsed,
+        );
     }
 }
