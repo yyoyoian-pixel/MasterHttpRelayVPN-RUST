@@ -1105,6 +1105,9 @@ async fn fire_batch(
                             "batch response mismatch: idx={} but r.len()={} (sent {} ops) from script {}",
                             idx, batch_resp.r.len(), n_ops, sid_short,
                         );
+                        if batch_resp.r.is_empty() && n_ops > 0 {
+                            f.mark_zstd_unsupported();
+                        }
                         let _ = reply.send(Err(format!(
                             "missing response in batch from script {}",
                             sid_short

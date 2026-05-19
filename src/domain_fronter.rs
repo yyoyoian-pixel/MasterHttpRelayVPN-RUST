@@ -412,6 +412,7 @@ pub struct DomainFronter {
     /// payloads. Mirrors `Config::disable_padding` (#391). Default false
     /// (padding active = stronger DPI defense at +25% bandwidth cost).
     disable_padding: bool,
+    zstd_unsupported: Arc<AtomicBool>,
     /// Per-instance auto-blacklist tuning. Mirrors `Config::auto_blacklist_*`
     /// (#391, #444). Cached here so the hot path in `record_timeout_strike`
     /// doesn't have to reach back through the Config (which we don't keep
@@ -628,6 +629,7 @@ impl DomainFronter {
             today_bytes: AtomicU64::new(0),
             today_key: std::sync::Mutex::new(current_pt_day_key()),
             disable_padding: config.disable_padding,
+            zstd_unsupported: Arc::new(AtomicBool::new(false)),
             auto_blacklist_strikes: config.auto_blacklist_strikes.max(1),
             auto_blacklist_window: Duration::from_secs(
                 config.auto_blacklist_window_secs.clamp(1, 3600),
@@ -691,6 +693,13 @@ impl DomainFronter {
     /// change. Clamped to `[5s, 300s]` at construction.
     pub(crate) fn batch_timeout(&self) -> Duration {
         self.batch_timeout
+    }
+
+    pub(crate) fn mark_zstd_unsupported(&self) {
+        if !self.zstd_unsupported.load(Ordering::Relaxed) {
+            tracing::warn!("zstd batch compression not supported by deployment, falling back to uncompressed");
+            self.zstd_unsupported.store(true, Ordering::Relaxed);
+        }
     }
 
     /// Record one relay call toward the daily budget. Called once per
@@ -3107,14 +3116,22 @@ impl DomainFronter {
         let mut map = serde_json::Map::new();
         map.insert("k".into(), Value::String(self.auth_key.clone()));
         map.insert("t".into(), Value::String("batch".into()));
-        let ops_json = serde_json::to_vec(ops)?;
-        match zstd::encode_all(ops_json.as_slice(), 3) {
-            Ok(compressed) => {
-                map.insert("zops".into(), Value::String(B64.encode(&compressed)));
+        let use_zstd = !self.zstd_unsupported.load(Ordering::Relaxed);
+        if use_zstd {
+            let ops_json = serde_json::to_vec(ops)?;
+            match zstd::encode_all(ops_json.as_slice(), 3) {
+                Ok(compressed) => {
+                    map.insert("zops".into(), Value::String(B64.encode(&compressed)));
+                    map.insert("zc".into(), Value::Number(1.into()));
+                }
+                Err(_) => {
+                    map.insert("ops".into(), serde_json::to_value(ops)?);
+                    map.insert("zc".into(), Value::Number(1.into()));
+                }
             }
-            Err(_) => {
-                map.insert("ops".into(), serde_json::to_value(ops)?);
-            }
+        } else {
+            map.insert("ops".into(), serde_json::to_value(ops)?);
+            map.insert("zc".into(), Value::Number(1.into()));
         }
         if !self.disable_padding {
             add_random_pad(&mut map);

@@ -680,6 +680,8 @@ struct BatchRequest {
     ops: Vec<BatchOp>,
     #[serde(default)]
     zops: Option<String>,
+    #[serde(default)]
+    zc: Option<u8>,
 }
 
 #[derive(Deserialize)]
@@ -775,7 +777,7 @@ async fn handle_batch(
         }
     };
 
-    let client_zstd = req.zops.is_some();
+    let client_zstd = req.zops.is_some() || req.zc.is_some();
     let ops: Vec<BatchOp> = if let Some(zops_b64) = req.zops {
         match B64.decode(&zops_b64) {
             Ok(compressed) => match zstd::decode_all(compressed.as_slice()) {
