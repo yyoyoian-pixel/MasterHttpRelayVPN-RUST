@@ -109,7 +109,7 @@ data class MhrvConfig(
     /** Block QUIC (UDP/443). QUIC over TCP tunnel causes meltdown. */
     val blockQuic: Boolean = true,
     /** Block STUN/TURN ports (3478/5349/19302). Forces WebRTC TCP fallback. */
-    val blockStun: Boolean = true,
+    val blockStun: Boolean = false,
     val upstreamSocks5: String = "",
 
     /**
@@ -453,7 +453,7 @@ object ConfigStore {
             coalesceStepMs = obj.optInt("coalesce_step_ms", 10),
             coalesceMaxMs = obj.optInt("coalesce_max_ms", 1000),
             blockQuic = obj.optBoolean("block_quic", true),
-            blockStun = obj.optBoolean("block_stun", true),
+            blockStun = obj.optBoolean("block_stun", false),
             upstreamSocks5 = obj.optString("upstream_socks5", ""),
             passthroughHosts = obj.optJSONArray("passthrough_hosts")?.let { arr ->
                 buildList { for (i in 0 until arr.length()) add(arr.optString(i)) }
