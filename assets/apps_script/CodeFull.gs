@@ -201,6 +201,11 @@ function _doTunnel(req) {
 // On a 5-DNS-query batch, this collapses 5 serial cache.get round trips
 // into one cache.getAll round trip.
 function _doTunnelBatch(req) {
+  // Compressed batch: forward opaquely, skip edge-DNS inspection.
+  if (req.zops) {
+    return _doTunnelBatchForwardCompressed(req.zops);
+  }
+
   var ops = (req && req.ops) || [];
 
   // Feature off: byte-identical to the pre-feature behavior.
@@ -292,6 +297,23 @@ function _doTunnelBatchForward(ops) {
     method: "post",
     contentType: "application/json",
     payload: JSON.stringify({ k: TUNNEL_AUTH_KEY, ops: ops }),
+    muteHttpExceptions: true,
+    followRedirects: true,
+  });
+  if (resp.getResponseCode() !== 200) {
+    return _json({ e: "tunnel batch HTTP " + resp.getResponseCode() });
+  }
+  return ContentService.createTextOutput(resp.getContentText())
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+// Compressed forward: zops is an opaque blob, passed to tunnel-node as-is.
+// Response is also opaque (may contain zr instead of r).
+function _doTunnelBatchForwardCompressed(zops) {
+  var resp = UrlFetchApp.fetch(TUNNEL_SERVER_URL + "/tunnel/batch", {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify({ k: TUNNEL_AUTH_KEY, zops: zops }),
     muteHttpExceptions: true,
     followRedirects: true,
   });

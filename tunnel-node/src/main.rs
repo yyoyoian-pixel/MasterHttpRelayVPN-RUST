@@ -676,7 +676,10 @@ impl TunnelResponse {
 #[derive(Deserialize)]
 struct BatchRequest {
     k: String,
+    #[serde(default)]
     ops: Vec<BatchOp>,
+    #[serde(default)]
+    zops: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -772,6 +775,37 @@ async fn handle_batch(
         }
     };
 
+    let client_zstd = req.zops.is_some();
+    let ops: Vec<BatchOp> = if let Some(zops_b64) = req.zops {
+        match B64.decode(&zops_b64) {
+            Ok(compressed) => match zstd::decode_all(compressed.as_slice()) {
+                Ok(decompressed) => match serde_json::from_slice(&decompressed) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let resp = serde_json::to_vec(&BatchResponse {
+                            r: vec![TunnelResponse::error(format!("zops json: {}", e))],
+                        }).unwrap_or_default();
+                        return (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], resp);
+                    }
+                },
+                Err(e) => {
+                    let resp = serde_json::to_vec(&BatchResponse {
+                        r: vec![TunnelResponse::error(format!("zstd decode: {}", e))],
+                    }).unwrap_or_default();
+                    return (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], resp);
+                }
+            },
+            Err(e) => {
+                let resp = serde_json::to_vec(&BatchResponse {
+                    r: vec![TunnelResponse::error(format!("zops b64: {}", e))],
+                }).unwrap_or_default();
+                return (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], resp);
+            }
+        }
+    } else {
+        req.ops
+    };
+
     if req.k != *state.auth_key {
         if state.diagnostic_mode {
             let resp = serde_json::to_vec(&BatchResponse {
@@ -804,7 +838,7 @@ async fn handle_batch(
     // `connect_data` dominates in practice (new clients), but `connect`
     // still fires from server-speaks-first ports and from the preread
     // timeout fallback path.
-    let mut results: Vec<(usize, TunnelResponse)> = Vec::with_capacity(req.ops.len());
+    let mut results: Vec<(usize, TunnelResponse)> = Vec::with_capacity(ops.len());
     // Each drain entry carries the session's `Arc<…Inner>` alongside the
     // sid. Phase 2 drains through the Arc directly so the global sessions
     // map lock isn't held across the per-session read_buf / packets
@@ -825,7 +859,7 @@ async fn handle_batch(
     }
     let mut new_conn_jobs: JoinSet<(usize, NewConn)> = JoinSet::new();
 
-    for (i, op) in req.ops.iter().enumerate() {
+    for (i, op) in ops.iter().enumerate() {
         match op.op.as_str() {
             "connect" => {
                 had_writes_or_connects = true;
@@ -1213,11 +1247,21 @@ async fn handle_batch(
 
     // Sort results by original index and build response
     results.sort_by_key(|(i, _)| *i);
-    let batch_resp = BatchResponse {
-        r: results.into_iter().map(|(_, r)| r).collect(),
+    let r_vec: Vec<TunnelResponse> = results.into_iter().map(|(_, r)| r).collect();
+
+    let json = if client_zstd {
+        let r_json = serde_json::to_vec(&r_vec).unwrap_or_default();
+        match zstd::encode_all(r_json.as_slice(), 3) {
+            Ok(compressed) => {
+                let zr_b64 = B64.encode(&compressed);
+                serde_json::to_vec(&serde_json::json!({"zr": zr_b64})).unwrap_or_default()
+            }
+            Err(_) => serde_json::to_vec(&BatchResponse { r: r_vec }).unwrap_or_default(),
+        }
+    } else {
+        serde_json::to_vec(&BatchResponse { r: r_vec }).unwrap_or_default()
     };
 
-    let json = serde_json::to_vec(&batch_resp).unwrap_or_default();
     (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], json)
 }
 

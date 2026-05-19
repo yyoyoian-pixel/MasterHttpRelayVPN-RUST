@@ -543,6 +543,8 @@ pub struct BatchTunnelResponse {
     pub r: Vec<TunnelResponse>,
     #[serde(default)]
     pub e: Option<String>,
+    #[serde(default)]
+    pub zr: Option<String>,
 }
 
 impl DomainFronter {
@@ -3105,7 +3107,15 @@ impl DomainFronter {
         let mut map = serde_json::Map::new();
         map.insert("k".into(), Value::String(self.auth_key.clone()));
         map.insert("t".into(), Value::String("batch".into()));
-        map.insert("ops".into(), serde_json::to_value(ops)?);
+        let ops_json = serde_json::to_vec(ops)?;
+        match zstd::encode_all(ops_json.as_slice(), 3) {
+            Ok(compressed) => {
+                map.insert("zops".into(), Value::String(B64.encode(&compressed)));
+            }
+            Err(_) => {
+                map.insert("ops".into(), serde_json::to_value(ops)?);
+            }
+        }
         if !self.disable_padding {
             add_random_pad(&mut map);
         }
@@ -3238,8 +3248,19 @@ impl DomainFronter {
             "batch response body (trace only): {}",
             &json_str[..json_str.len().min(500)]
         );
-        match serde_json::from_str(json_str) {
-            Ok(v) => Ok(v),
+        match serde_json::from_str::<BatchTunnelResponse>(json_str) {
+            Ok(mut resp) => {
+                if let Some(zr_b64) = resp.zr.take() {
+                    if let Ok(compressed) = B64.decode(&zr_b64) {
+                        if let Ok(decompressed) = zstd::decode_all(compressed.as_slice()) {
+                            if let Ok(r) = serde_json::from_slice(&decompressed) {
+                                resp.r = r;
+                            }
+                        }
+                    }
+                }
+                Ok(resp)
+            }
             Err(e) => {
                 // Same redaction policy on the error path. Length and
                 // the serde error message are enough to locate the
